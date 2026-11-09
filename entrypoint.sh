@@ -29,11 +29,11 @@ export OPENAI_API_KEY="$NINEROUTER_API_KEY"
 # --- OpenCode: provider "9router", sama dengan nama yang dipakai agent ---
 jq -n \
   --arg url "$ROUTER_URL/v1" \
-  --arg def "9router/$DEFAULT_MODEL" \
+  --arg defmodel "9router/$DEFAULT_MODEL" \
   --arg models "$ROUTER_MODELS" '
   {
     "$schema": "https://opencode.ai/config.json",
-    model: $def,
+    model: $defmodel,
     provider: {
       "9router": {
         npm: "@ai-sdk/openai-compatible",

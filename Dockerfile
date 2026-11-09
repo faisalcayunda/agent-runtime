@@ -51,6 +51,8 @@ RUN for c in multica opencode claude codex openclaw hermes; do \
 RUN useradd -m -u 1001 -s /bin/bash agent
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
 
+RUN bash -n /usr/local/bin/entrypoint.sh
+
 USER agent
 ENV HOME=/home/agent
 WORKDIR /home/agent
