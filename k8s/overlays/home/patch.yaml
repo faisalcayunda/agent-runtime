@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-runtime
+spec:
+  template:
+    spec:
+      nodeSelector:
+        storage: "true"
+      containers:
+        - name: runtime
+          envFrom:
+            - secretRef:
+                name: agent-runtime-home
+          env:
+            - name: RUNTIME_ID
+              value: rt-home
+            - name: MULTICA_DAEMON_MAX_CONCURRENT_TASKS
+              value: "3"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 4Gi

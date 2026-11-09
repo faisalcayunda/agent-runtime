@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-runtime
+  labels:
+    app: agent-runtime
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-runtime
+  template:
+    metadata:
+      labels:
+        app: agent-runtime
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runtime
+          image: ghcr.io/faisalcayunda/agent-runtime
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          envFrom:
+            - secretRef:
+                name: GANTI_DI_OVERLAY
+          env:
+            - name: RUNTIME_ID
+              value: GANTI_DI_OVERLAY
+            - name: ROUTER_URL
+              value: "http://ninerouter.ai.svc.cluster.local"
+            - name: DEFAULT_MODEL
+              value: "tier2-specialist-exec"
+            - name: SMALL_MODEL
+              value: "tier4-free"
+            - name: MULTICA_DAEMON_MAX_CONCURRENT_TASKS
+              value: "2"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: home
+              mountPath: /home/agent
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: agent-home
