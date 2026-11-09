@@ -9,7 +9,7 @@ ARG PI_VERSION=latest
 # dsh dikunci ke rentang yang didukung bridge Multica (>=0.2.1-rc.2 <0.3.0)
 ARG DSH_VERSION=0.2.1-rc.2
 ARG DSH_BRIDGE_REF=main
-ARG HERMES_REF=main
+ARG HERMES_REF=466591fe65d0257c96083df16fcd39636032304c
 
 # --- Paket sistem + alat feedback loop ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -34,14 +34,20 @@ RUN curl -fsSL https://opencode.ai/install | bash \
     && [ -n "$O" ] \
     && { [ "$O" = /usr/local/bin/opencode ] || install -m 0755 "$O" /usr/local/bin/opencode; }
 
-# --- Hermes: clone repo resmi + editable install (wheel biasa ditolak Hermes) ---
-RUN git clone --depth 1 --branch "${HERMES_REF}" --recurse-submodules --shallow-submodules \
-         https://github.com/NousResearch/hermes-agent.git /opt/hermes/src \
+# --- Hermes: commit yang dikunci + editable install ---
+RUN mkdir -p /opt/hermes/src && cd /opt/hermes/src \
+    && git init -q \
+    && git remote add origin https://github.com/NousResearch/hermes-agent.git \
+    && git fetch -q --depth 1 origin "${HERMES_REF}" \
+    && git checkout -q FETCH_HEAD \
+    && git submodule update --init --recursive --depth 1 \
     && python3 -m venv /opt/hermes/venv \
     && /opt/hermes/venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/hermes/venv/bin/pip install --no-cache-dir -e "/opt/hermes/src[all]" \
-    && ln -s /opt/hermes/venv/bin/hermes /usr/local/bin/hermes \
-    && git -C /opt/hermes/src rev-parse HEAD > /opt/hermes/COMMIT
+    && ln -sf /opt/hermes/venv/bin/hermes /usr/local/bin/hermes \
+    && ln -sf /opt/hermes/venv/bin/hermes-acp /usr/local/bin/hermes-acp \
+    && git rev-parse HEAD > /opt/hermes/COMMIT \
+    && hermes --version
 
 # --- Bridge resmi Multica <-> DeepSeek Harness (build dari source) ---
 RUN git clone --depth 1 --branch "${DSH_BRIDGE_REF}" \
