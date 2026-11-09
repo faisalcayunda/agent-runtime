@@ -1,4 +1,6 @@
-FROM node:22-bookworm-slim
+FROM node:24-bookworm-slim
+
+RUN node --version && npm --version
 
 ARG OPENCODE_VERSION=latest
 ARG CLAUDE_CODE_VERSION=latest
