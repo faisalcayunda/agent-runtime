@@ -18,6 +18,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gh shellcheck make \
     && rm -rf /var/lib/apt/lists/*
 
+# --- uv + lokasi Python terkelola yang bisa dibaca semua user ---
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh \
+    && uv --version
+
 # --- CLI berbasis Node (paket npm resmi) + pnpm untuk build bridge dsh ---
 RUN npm install -g \
       @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
@@ -68,11 +73,6 @@ RUN curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts
     && [ -n "$M" ] \
     && { [ "$M" = /usr/local/bin/multica ] || install -m 0755 "$M" /usr/local/bin/multica; }
 
-# --- uv + lokasi Python terkelola yang bisa dibaca semua user ---
-ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh \
-    && uv --version
-
 # --- RTK (binary rilis resmi) ---
 RUN curl -fsSL -o /tmp/rtk.tgz \
       https://github.com/rtk-ai/rtk/releases/latest/download/rtk-x86_64-unknown-linux-musl.tar.gz \
@@ -90,14 +90,13 @@ RUN mkdir -p /opt/agent-assets \
     && chmod -R a+rX /opt/agent-assets
 
 # --- Build gagal jika ada CLI yang tidak terpasang ---
-RUN for c in multica opencode claude codex openclaw hermes pi dsh rtk uv gh shellcheck; do \
+RUN for c in multica opencode claude codex openclaw hermes hermes-acp pi dsh rtk uv gh shellcheck; do \
       command -v "$c" >/dev/null || { echo "CLI hilang: $c"; exit 1; }; \
       printf '%s: ' "$c"; "$c" --version 2>&1 | head -n1 || true; \
     done \
     && echo "hermes commit: $(cat /opt/hermes/COMMIT)" \
     && echo "dsh bridge commit: $(cat /opt/dsh-multica-runtime/COMMIT)" \
-    && echo "skill Matt Pocock: $(find /opt/agent-assets/mattpocock-skills -name SKILL.md | wc -l) skill" \
-    && { hermes acp --help >/dev/null 2>&1 && echo "hermes acp: tersedia" || echo "PERINGATAN: hermes acp tidak tersedia"; }
+    && echo "skill Matt Pocock: $(find /opt/agent-assets/mattpocock-skills -name SKILL.md | wc -l) skill"
 
 RUN useradd -m -u 1001 -s /bin/bash agent
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
