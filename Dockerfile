@@ -34,20 +34,23 @@ RUN curl -fsSL https://opencode.ai/install | bash \
     && [ -n "$O" ] \
     && { [ "$O" = /usr/local/bin/opencode ] || install -m 0755 "$O" /usr/local/bin/opencode; }
 
-# --- Hermes: commit yang dikunci + editable install ---
+# --- Hermes: commit dikunci, Python 3.14 + dependensi persis dari uv.lock ---
 RUN mkdir -p /opt/hermes/src && cd /opt/hermes/src \
     && git init -q \
     && git remote add origin https://github.com/NousResearch/hermes-agent.git \
     && git fetch -q --depth 1 origin "${HERMES_REF}" \
     && git checkout -q FETCH_HEAD \
     && git submodule update --init --recursive --depth 1 \
-    && python3 -m venv /opt/hermes/venv \
-    && /opt/hermes/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/hermes/venv/bin/pip install --no-cache-dir -e "/opt/hermes/src[all]" \
+    && git rev-parse HEAD > /opt/hermes/COMMIT \
+    && uv python install 3.14 \
+    && UV_PROJECT_ENVIRONMENT=/opt/hermes/venv \
+         uv sync --frozen --python 3.14 --extra all --no-dev \
     && ln -sf /opt/hermes/venv/bin/hermes /usr/local/bin/hermes \
     && ln -sf /opt/hermes/venv/bin/hermes-acp /usr/local/bin/hermes-acp \
-    && git rev-parse HEAD > /opt/hermes/COMMIT \
-    && hermes --version
+    && chmod -R a+rX /opt/uv-python /opt/hermes \
+    && hermes --version \
+    && hermes config --help >/dev/null \
+    && echo "hermes: dependensi lengkap"
 
 # --- Bridge resmi Multica <-> DeepSeek Harness (build dari source) ---
 RUN git clone --depth 1 --branch "${DSH_BRIDGE_REF}" \
@@ -65,8 +68,10 @@ RUN curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts
     && [ -n "$M" ] \
     && { [ "$M" = /usr/local/bin/multica ] || install -m 0755 "$M" /usr/local/bin/multica; }
 
-# --- uv (tool Python cepat: ruff, pytest, dll.) ---
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh
+# --- uv + lokasi Python terkelola yang bisa dibaca semua user ---
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh \
+    && uv --version
 
 # --- RTK (binary rilis resmi) ---
 RUN curl -fsSL -o /tmp/rtk.tgz \
