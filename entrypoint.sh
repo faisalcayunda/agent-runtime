@@ -177,6 +177,10 @@ if [ ! -f "$DSH_MARK" ]; then
   fi
 fi
 # Katalog model + model default dsh -> alias 9router (lapisan user: cordis.patch.yml; JSON = YAML valid)
+# Juga matikan: session-log-deepseek + plugin-package-inventory-deepseek (menambah field body
+# dsh_session_log/dsh_plugin_packages; Anthropic menolak "Extra inputs are not permitted") dan
+# web_search (tool-web search:false; provider-nya memanggil api.deepseek.com langsung dengan key router).
+# web_fetch tetap jalan (provider http, tidak ke DeepSeek).
 DSH_PATCH="$HOME/.dsh/profiles/multica/cordis.patch.yml"
 { echo "# dikelola entrypoint.sh, ditimpa tiap boot; patch sendiri lewat --patch"
   jq -n \
@@ -186,7 +190,10 @@ DSH_PATCH="$HOME/.dsh/profiles/multica/cordis.patch.yml"
     { id: "llm-deepseek",
       config: { models: ($models | split(" ") | map(select(length > 0)) | map({id: ., name: .})) } },
     { id: "agent-default-model",
-      config: { provider: "deepseek-official", model: $defmodel } }
+      config: { provider: "deepseek-official", model: $defmodel } },
+    { id: "session-log-deepseek", disabled: true },
+    { id: "plugin-package-inventory-deepseek", disabled: true },
+    { id: "tool-web", config: { search: false } }
   ]'; } > "$DSH_PATCH.tmp" \
   && mv "$DSH_PATCH.tmp" "$DSH_PATCH" \
   && echo "[agent-runtime] dsh model patch: ok" \
