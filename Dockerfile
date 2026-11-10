@@ -5,7 +5,8 @@ RUN node --version && npm --version
 ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
 ARG OPENCLAW_VERSION=latest
-ARG PI_VERSION=latest
+# pi: paket lama @mariozechner/pi-coding-agent deprecated (berhenti di 0.73.1); penggantinya @earendil-works, dikunci ke versi pasti
+ARG PI_VERSION=1.5.1
 # dsh dikunci ke rentang yang didukung bridge Multica (>=0.2.1-rc.2 <0.3.0)
 ARG DSH_VERSION=0.2.1-rc.2
 ARG DSH_BRIDGE_REF=main
@@ -28,7 +29,7 @@ RUN npm install -g \
       @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
       @openai/codex@${CODEX_VERSION} \
       openclaw@${OPENCLAW_VERSION} \
-      @mariozechner/pi-coding-agent@${PI_VERSION} \
+      @earendil-works/pi-coding-agent@${PI_VERSION} \
       @deepseek-ai/dsh@${DSH_VERSION} \
       pnpm \
     && npm cache clean --force
