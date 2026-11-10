@@ -99,11 +99,15 @@ PI_SETTINGS="$HOME/.pi/agent/settings.json"
   && echo "[agent-runtime] pi default model: ok" \
   || echo "[agent-runtime] pi default model: GAGAL (diabaikan)"
 
-# --- Hermes: config.yaml sumber kebenaran endpoint; key dari OPENAI_API_KEY (base_url harus sama persis dgn OPENAI_BASE_URL) ---
+# --- Hermes: config.yaml sumber kebenaran endpoint; key dirujuk lewat nama env (model.key_env), bukan ditulis ke disk ---
 # urutan wajib provider -> base_url -> default: mengganti provider menghapus base_url lama
+# key_env wajib: gateway Hermes (di-spawn otomatis oleh `hermes chat`, dipakai bersama) mewarisi env proses yang
+# pertama memulainya. Shell `kubectl exec` hanya punya NINEROUTER_API_KEY (OPENAI_API_KEY di-export entrypoint ini),
+# jadi tanpa key_env gateway tanpa key -> semua chat berikutnya 401 sampai gateway idle-exit (600s).
 optional "hermes provider" hermes config set model.provider custom
 optional "hermes base_url" hermes config set model.base_url "$ROUTER_URL/v1"
 optional "hermes model" hermes config set model.default "$DEFAULT_MODEL"
+optional "hermes key_env" hermes config set model.key_env NINEROUTER_API_KEY
 
 # --- OpenClaw: provider custom "9router"; key dirujuk lewat ${NINEROUTER_API_KEY} ---
 OPENCLAW_PROVIDER="$(jq -nc \

@@ -3,6 +3,10 @@ name: build
 on:
   push:
     branches: [main]
+  # Harian 17:17 UTC = 00:17 WIB (menit ganjil: hindari antrean awal jam, harus selesai sebelum updater 19:30 UTC): ambil versi "latest" terbaru dari semua CLI.
+  # Catatan: GitHub menonaktifkan workflow terjadwal setelah 60 hari tanpa aktivitas repo.
+  schedule:
+    - cron: "17 17 * * *"
   workflow_dispatch:
 
 permissions:
@@ -21,12 +25,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        run: echo "tag=$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "tag=$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          # Satu nilai per hari UTC: push di hari yang sama memakai cache, build terjadwal besok memutakhirkan CLI.
+          echo "refresh=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
           push: true
+          build-args: |
+            CLI_REFRESH=${{ steps.meta.outputs.refresh }}
           tags: |
             ghcr.io/faisalcayunda/agent-runtime:${{ steps.meta.outputs.tag }}
             ghcr.io/faisalcayunda/agent-runtime:latest

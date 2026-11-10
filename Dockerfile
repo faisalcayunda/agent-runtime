@@ -24,23 +24,7 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh \
     && uv --version
 
-# --- CLI berbasis Node (paket npm resmi) + pnpm untuk build bridge dsh ---
-RUN npm install -g \
-      @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
-      @openai/codex@${CODEX_VERSION} \
-      openclaw@${OPENCLAW_VERSION} \
-      @earendil-works/pi-coding-agent@${PI_VERSION} \
-      @deepseek-ai/dsh@${DSH_VERSION} \
-      pnpm \
-    && npm cache clean --force
-
-# --- OpenCode dari installer resmi ---
-RUN curl -fsSL https://opencode.ai/install | bash \
-    && O="$(command -v opencode || find / -xdev -type f -name opencode -perm -u+x 2>/dev/null | head -n1)" \
-    && [ -n "$O" ] \
-    && { [ "$O" = /usr/local/bin/opencode ] || install -m 0755 "$O" /usr/local/bin/opencode; }
-
-# --- Hermes: commit dikunci, Python 3.14 + dependensi persis dari uv.lock ---
+# --- Hermes: commit dikunci (di atas CLI_REFRESH supaya tidak ikut rebuild tiap hari), Python 3.14 + dependensi persis dari uv.lock ---
 RUN mkdir -p /opt/hermes/src && cd /opt/hermes/src \
     && git init -q \
     && git remote add origin https://github.com/NousResearch/hermes-agent.git \
@@ -57,6 +41,28 @@ RUN mkdir -p /opt/hermes/src && cd /opt/hermes/src \
     && hermes --version \
     && hermes config --help >/dev/null \
     && echo "hermes: dependensi lengkap"
+
+# --- Cache-bust harian untuk semua CLI yang mengambil "latest" ---
+# Workflow mengisi CLI_REFRESH dengan tanggal UTC. ARG yang berubah membatalkan cache semua layer
+# sesudahnya, jadi layer sistem/uv/Hermes (yang dikunci) harus ada DI ATAS baris ini.
+ARG CLI_REFRESH=manual
+RUN echo "CLI refresh: ${CLI_REFRESH}"
+
+# --- CLI berbasis Node (paket npm resmi) + pnpm untuk build bridge dsh ---
+RUN npm install -g \
+      @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
+      @openai/codex@${CODEX_VERSION} \
+      openclaw@${OPENCLAW_VERSION} \
+      @earendil-works/pi-coding-agent@${PI_VERSION} \
+      @deepseek-ai/dsh@${DSH_VERSION} \
+      pnpm \
+    && npm cache clean --force
+
+# --- OpenCode dari installer resmi ---
+RUN curl -fsSL https://opencode.ai/install | bash \
+    && O="$(command -v opencode || find / -xdev -type f -name opencode -perm -u+x 2>/dev/null | head -n1)" \
+    && [ -n "$O" ] \
+    && { [ "$O" = /usr/local/bin/opencode ] || install -m 0755 "$O" /usr/local/bin/opencode; }
 
 # --- Bridge resmi Multica <-> DeepSeek Harness (build dari source) ---
 RUN git clone --depth 1 --branch "${DSH_BRIDGE_REF}" \
@@ -90,10 +96,12 @@ RUN mkdir -p /opt/agent-assets \
     && rm -rf /opt/agent-assets/mattpocock-skills/.git \
     && chmod -R a+rX /opt/agent-assets
 
-# --- Build gagal jika ada CLI yang tidak terpasang ---
+# --- Build gagal jika ada CLI yang tidak terpasang atau rusak ---
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN for c in multica opencode claude codex openclaw hermes hermes-acp pi dsh rtk uv gh shellcheck; do \
       command -v "$c" >/dev/null || { echo "CLI hilang: $c"; exit 1; }; \
-      printf '%s: ' "$c"; "$c" --version 2>&1 | head -n1 || true; \
+      v="$("$c" --version 2>&1)" || { echo "CLI rusak: $c: $v"; exit 1; }; \
+      printf '%s: %s\n' "$c" "${v%%$'\n'*}"; \
     done \
     && echo "hermes commit: $(cat /opt/hermes/COMMIT)" \
     && echo "dsh bridge commit: $(cat /opt/dsh-multica-runtime/COMMIT)" \
