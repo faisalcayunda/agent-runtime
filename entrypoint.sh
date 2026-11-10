@@ -131,6 +131,15 @@ for f in "$HOME/.claude/CLAUDE.md" \
          "$HOME/.config/opencode/AGENTS.md" \
          "$HOME/.pi/agent/AGENTS.md"; do
   cp "$ASSETS/AGENTS.md" "$f"
+  # node bisa mati kapan saja (ADR 0001 homelab-infra): kerja yang belum di-push dianggap hilang
+  cat >> "$f" <<'MD'
+
+## Push your work
+
+This machine can lose power or be paused at any time, and its disk is treated as a cache.
+After each meaningful step, commit and push to a WIP branch (for example `wip/<task>`).
+Never leave work only on the local disk.
+MD
 done
 
 # --- Skill Matt Pocock (hanya skill miliknya yang ditimpa) ---
