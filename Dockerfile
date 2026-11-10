@@ -42,6 +42,19 @@ RUN mkdir -p /opt/hermes/src && cd /opt/hermes/src \
     && hermes config --help >/dev/null \
     && echo "hermes: dependensi lengkap"
 
+# --- RTK: dikunci ke v1.1.0 (binary rilis resmi, sha256 dicek) ---
+# v1.2.0+ (musl x86_64) mati SIGILL di CPU tanpa AVX (home-server i3-2100): rtk-ai/rtk#5043.
+# Naikkan RTK_VERSION + RTK_SHA256 hanya setelah isu itu beres dan `rtk --version` terbukti jalan di home-server.
+ARG RTK_VERSION=v1.1.0
+ARG RTK_SHA256=9454ad1b9489daa57ab0a9f4ebe2faaf4dc82b8a0f26c9e5135151abd7c9378d
+RUN mkdir /tmp/rtk && cd /tmp/rtk \
+    && curl -fsSL -o rtk.tgz \
+         "https://github.com/rtk-ai/rtk/releases/download/${RTK_VERSION}/rtk-x86_64-unknown-linux-musl.tar.gz" \
+    && echo "${RTK_SHA256}  rtk.tgz" | sha256sum -c - \
+    && tar -xzf rtk.tgz \
+    && install -m 0755 "$(find . -type f -name rtk | head -n1)" /usr/local/bin/rtk \
+    && cd / && rm -rf /tmp/rtk
+
 # --- Cache-bust harian untuk semua CLI yang mengambil "latest" ---
 # Workflow mengisi CLI_REFRESH dengan tanggal UTC. ARG yang berubah membatalkan cache semua layer
 # sesudahnya, jadi layer sistem/uv/Hermes (yang dikunci) harus ada DI ATAS baris ini.
@@ -79,13 +92,6 @@ RUN curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts
     && M="$(command -v multica || find / -xdev -type f -name multica -perm -u+x 2>/dev/null | head -n1)" \
     && [ -n "$M" ] \
     && { [ "$M" = /usr/local/bin/multica ] || install -m 0755 "$M" /usr/local/bin/multica; }
-
-# --- RTK (binary rilis resmi) ---
-RUN curl -fsSL -o /tmp/rtk.tgz \
-      https://github.com/rtk-ai/rtk/releases/latest/download/rtk-x86_64-unknown-linux-musl.tar.gz \
-    && tar -xzf /tmp/rtk.tgz -C /tmp \
-    && install -m 0755 "$(find /tmp -type f -name rtk | head -n1)" /usr/local/bin/rtk \
-    && rm -rf /tmp/rtk*
 
 # --- Aset kualitas agent: pedoman Karpathy + skill Matt Pocock ---
 RUN mkdir -p /opt/agent-assets \

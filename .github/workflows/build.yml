@@ -41,3 +41,29 @@ jobs:
             ghcr.io/faisalcayunda/agent-runtime:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Retensi GHCR: simpan 14 versi bertag terbaru, hapus sisanya.
+  # Child manifest (attestation/arch) milik index yang dipertahankan dilindungi otomatis oleh action (>= v3.1.0).
+  # Awalnya dry-run: set repo variable RETENTION_LIVE=true (Settings > Variables) setelah log dry-run dicek.
+  # Prasyarat sekali: package agent-runtime > Package settings > Manage Actions access > tambah repo ini dengan role Admin.
+  retention:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    concurrency:
+      group: ghcr-retention
+      cancel-in-progress: false
+    steps:
+      - uses: snok/container-retention-policy@d3bdcf5ce9b05f685154e4a16c39233b245e3d53 # v3.1.0
+        with:
+          account: user
+          token: ${{ secrets.GITHUB_TOKEN }}
+          image-names: agent-runtime
+          image-tags: "*"
+          tag-selection: both
+          keep-n-most-recent: 14
+          # Versi yang baru dibuat (child manifest belum bertag) tidak disentuh.
+          cut-off: 1h
+          timestamp-to-use: created_at
+          dry-run: ${{ vars.RETENTION_LIVE != 'true' }}
