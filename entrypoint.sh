@@ -6,9 +6,10 @@ set -euo pipefail
 : "${RUNTIME_ID:?RUNTIME_ID belum diisi}"
 
 ROUTER_URL="${ROUTER_URL:-http://ninerouter.ai.svc.cluster.local}"
-DEFAULT_MODEL="${DEFAULT_MODEL:-tier2-specialist-exec}"
-SMALL_MODEL="${SMALL_MODEL:-tier4-free}"
-ROUTER_MODELS="${ROUTER_MODELS:-tier1-judge tier2-specialist-exec tier2-adversarial-critic tier3-fast-research tier4-free gemini-3.8-flash}"
+# combo per role di 9router; Claude Code hanya boleh combo yang isinya Claude semua (role-exec, role-architect)
+DEFAULT_MODEL="${DEFAULT_MODEL:-role-exec}"
+SMALL_MODEL="${SMALL_MODEL:-role-exec}"
+ROUTER_MODELS="${ROUTER_MODELS:-role-leader role-architect role-exec role-review role-research role-writer role-designer gemini-3.8-flash}"
 CODEX_WIRE_API="${CODEX_WIRE_API:-responses}"
 ASSETS=/opt/agent-assets
 DSH_BRIDGE=/opt/dsh-multica-runtime
@@ -23,7 +24,7 @@ mkdir -p "$MULTICA_WORKSPACES_ROOT" "$HOME/.agent-runtime" \
 export ANTHROPIC_BASE_URL="${CLAUDE_BASE_URL:-$ROUTER_URL}"
 export ANTHROPIC_AUTH_TOKEN="$NINEROUTER_API_KEY"
 export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-$DEFAULT_MODEL}"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-tier1-judge}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-role-architect}"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$DEFAULT_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$SMALL_MODEL"
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
