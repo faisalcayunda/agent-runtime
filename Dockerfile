@@ -124,6 +124,8 @@ ARG ANTISLOP_SHA=4520786d3dff09eb295a2c563c7fab50063f00fb
 ARG CLAUDE_CONFIG_SHA=9f7c25e15cdac924efbf7135aea879602dfe53a6
 ARG REA_VERSION=6.8.0
 ARG REA_SKILL_SHA=160d821ac9a0310afcb8d1fc427862dd6508add5
+# TypeSafe skill (typesafe-ai/skills, main per 2026-11-12; owner added it 2026-11-12, plain skill dir, no plugin)
+ARG TYPESAFE_SHA=302eea662c54bca6730873fe245bec1d69ebc23d
 
 # --- wa-agent: dependensi dulu (cache), lalu kode. Hanya yang dibutuhkan runtime (bukan test/, spike/, node_modules lokal). ---
 COPY wa-agent/package.json wa-agent/package-lock.json wa-agent/.npmrc /opt/wa-agent/
@@ -141,13 +143,14 @@ RUN node -e 'const [a,b,c]=process.versions.node.split(".").map(Number); if(!(a>
     && npm cache clean --force \
     && rea --version
 
-# --- Skill: tepat empat aset (mattpocock dari manifest plugin, antislop enam dir, REA) ke /opt/agent-assets/skills ---
+# --- Skill: tepat lima aset (mattpocock dari manifest plugin, antislop enam dir, REA, TypeSafe) ke /opt/agent-assets/skills ---
 RUN T="$(mktemp -d)" \
     && /opt/wa-agent/build/fetch-sha.sh https://github.com/miqdadbadjuber/anti-slop "${ANTISLOP_SHA}" "$T/as" skills \
     && /opt/wa-agent/build/fetch-sha.sh https://github.com/morluto/rea "${REA_SKILL_SHA}" "$T/rea" .agents/skills/reverse-engineer-anything \
+    && /opt/wa-agent/build/fetch-sha.sh https://github.com/typesafe-ai/skills "${TYPESAFE_SHA}" "$T/ts" skills/typesafe-ai \
     && /opt/wa-agent/build/assemble-skills.sh /opt/agent-assets/mattpocock-skills "$T/as" \
-         "$T/rea/.agents/skills/reverse-engineer-anything" /opt/agent-assets/skills \
-    && { echo "antislop ${ANTISLOP_SHA}"; echo "rea-skill ${REA_SKILL_SHA} (rea-agents ${REA_VERSION})"; \
+         "$T/rea/.agents/skills/reverse-engineer-anything" "$T/ts/skills/typesafe-ai" /opt/agent-assets/skills \
+    && { echo "antislop ${ANTISLOP_SHA}"; echo "rea-skill ${REA_SKILL_SHA} (rea-agents ${REA_VERSION})"; echo "typesafe ${TYPESAFE_SHA}"; \
          echo "mattpocock $(cat /opt/agent-assets/mattpocock-skills.COMMIT)"; } > /opt/agent-assets/skills.COMMITS \
     && rm -rf "$T"
 

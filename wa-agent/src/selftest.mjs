@@ -137,7 +137,7 @@ export async function selftest(opts = {}) {
 
   const skillsHere = existsSync(join(claude, "skills")) ? readdirSync(join(claude, "skills")).sort() : [];
   const skillsWant = existsSync(join(assetsDir, "skills")) ? readdirSync(join(assetsDir, "skills")).sort() : [];
-  const need = ["grill-with-docs", "reverse-engineer-anything", ...ANTISLOP];
+  const need = ["grill-with-docs", "reverse-engineer-anything", "typesafe-ai", ...ANTISLOP];
   const missing = need.filter((s) => !skillsHere.includes(s));
   const plug = spawnSync(bin, ["plugin", "list"], { encoding: "utf8", env });
   const plugText = `${plug.stdout}${plug.stderr}`.trim();
