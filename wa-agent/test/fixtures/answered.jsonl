@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"__SID__","model":"role-exec"}
+{"type":"user","session_id":"__SID__","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ask1","content":"User has answered: React","is_error":false}]}}
+{"type":"assistant","uuid":"u-ans-1","session_id":"__SID__","message":{"id":"msg_a1","role":"assistant","content":[{"type":"text","text":"Oke, pakai React."}]}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"__SID__","stop_reason":"end_turn","duration_ms":700,"result":"Oke, pakai React.","usage":{"input_tokens":4,"output_tokens":6},"modelUsage":{"role-exec":{}},"permission_denials":[]}

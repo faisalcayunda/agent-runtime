@@ -113,6 +113,62 @@ RUN for c in multica opencode claude codex openclaw hermes hermes-acp pi dsh rtk
     && echo "dsh bridge commit: $(cat /opt/dsh-multica-runtime/COMMIT)" \
     && echo "skill Matt Pocock: $(find /opt/agent-assets/mattpocock-skills -name SKILL.md | wc -l) skill"
 
+# =====================================================================================================
+# Gremio (wa-agent, PLAN phase 3): semua sebagai root, sebelum USER agent, jadi uid 1001 tidak bisa mengubahnya.
+# Pod Multica tidak membaca /opt/wa-agent, /opt/agent-assets/skills, /opt/agent-assets/agents (entrypoint.sh hanya
+# membaca AGENTS.md dan mattpocock-skills). Semua sumber dikunci ke SHA/versi pasti; naik versi = ganti ARG.
+# =====================================================================================================
+# antislop (github.com/miqdadbadjuber/anti-slop, main per 2026-11-11), claude-config (main per 2026-11-09),
+# REA: paket npm dan skill-nya dari tag git rea-agents-6.8.0 yang sama (bukan `npx skills add`: tidak menulis ke home).
+ARG ANTISLOP_SHA=4520786d3dff09eb295a2c563c7fab50063f00fb
+ARG CLAUDE_CONFIG_SHA=9f7c25e15cdac924efbf7135aea879602dfe53a6
+ARG REA_VERSION=6.8.0
+ARG REA_SKILL_SHA=160d821ac9a0310afcb8d1fc427862dd6508add5
+
+# --- wa-agent: dependensi dulu (cache), lalu kode. Hanya yang dibutuhkan runtime (bukan test/, spike/, node_modules lokal). ---
+COPY wa-agent/package.json wa-agent/package-lock.json wa-agent/.npmrc /opt/wa-agent/
+RUN cd /opt/wa-agent && npm ci --omit=dev && npm cache clean --force
+COPY wa-agent/bin /opt/wa-agent/bin
+COPY wa-agent/build /opt/wa-agent/build
+COPY wa-agent/config /opt/wa-agent/config
+COPY wa-agent/hooks /opt/wa-agent/hooks
+COPY wa-agent/mcp /opt/wa-agent/mcp
+COPY wa-agent/src /opt/wa-agent/src
+
+# --- REA (morluto/rea): npm -g tidak memaksa engines, jadi Node >= 24.22.1 dicek sendiri ---
+RUN node -e 'const [a,b,c]=process.versions.node.split(".").map(Number); if(!(a>24||(a===24&&(b>22||(b===22&&c>=1))))){console.error("REA butuh Node >= 24.22.1, ada "+process.versions.node);process.exit(1)}' \
+    && npm install -g "rea-agents@${REA_VERSION}" \
+    && npm cache clean --force \
+    && rea --version
+
+# --- Skill: tepat empat aset (mattpocock dari manifest plugin, antislop enam dir, REA) ke /opt/agent-assets/skills ---
+RUN T="$(mktemp -d)" \
+    && /opt/wa-agent/build/fetch-sha.sh https://github.com/miqdadbadjuber/anti-slop "${ANTISLOP_SHA}" "$T/as" skills \
+    && /opt/wa-agent/build/fetch-sha.sh https://github.com/morluto/rea "${REA_SKILL_SHA}" "$T/rea" .agents/skills/reverse-engineer-anything \
+    && /opt/wa-agent/build/assemble-skills.sh /opt/agent-assets/mattpocock-skills "$T/as" \
+         "$T/rea/.agents/skills/reverse-engineer-anything" /opt/agent-assets/skills \
+    && { echo "antislop ${ANTISLOP_SHA}"; echo "rea-skill ${REA_SKILL_SHA} (rea-agents ${REA_VERSION})"; \
+         echo "mattpocock $(cat /opt/agent-assets/mattpocock-skills.COMMIT)"; } > /opt/agent-assets/skills.COMMITS \
+    && rm -rf "$T"
+
+# --- Subagent dari claude-config: buang 7, edit 2, strip penunjuk ke skill/rules yang tidak ada, lalu cek (gagal = build gagal) ---
+RUN T="$(mktemp -d)" \
+    && /opt/wa-agent/build/fetch-sha.sh https://github.com/faisalcayunda/claude-config "${CLAUDE_CONFIG_SHA}" "$T/cc" agents scripts/secret_scan.py \
+    && mkdir -p /opt/agent-assets/agents \
+    && cp "$T"/cc/agents/*.md /opt/agent-assets/agents/ \
+    && node /opt/wa-agent/build/agents.mjs strip /opt/agent-assets/agents /opt/agent-assets/skills \
+    && install -m 0644 "$T/cc/scripts/secret_scan.py" /opt/wa-agent/hooks/secret_scan.py \
+    && python3 -I /opt/wa-agent/hooks/secret_scan.py --selftest \
+    && echo "claude-config ${CLAUDE_CONFIG_SHA}" > /opt/agent-assets/agents.COMMIT \
+    && rm -rf "$T"
+
+# --- CLAUDE.md worker: pedoman Karpathy + aturan wa (tanpa blok "Push your work" milik Multica) ---
+RUN { cat /opt/agent-assets/AGENTS.md; printf '\n'; cat /opt/wa-agent/config/claude-wa.md; } > /opt/wa-agent/config/CLAUDE.md \
+    && chmod 0755 /opt/wa-agent/bin/*.sh /opt/wa-agent/build/*.sh \
+    && chmod -R a+rX,go-w /opt/wa-agent /opt/agent-assets \
+    && bash -n /opt/wa-agent/bin/worker-boot.sh \
+    && echo "wa-agent: $(ls /opt/agent-assets/skills | wc -l) skill, $(ls /opt/agent-assets/agents | wc -l) agent"
+
 RUN useradd -m -u 1001 -s /bin/bash agent
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN bash -n /usr/local/bin/entrypoint.sh

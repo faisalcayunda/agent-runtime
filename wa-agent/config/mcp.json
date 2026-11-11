@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "owner": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/opt/wa-agent/mcp/owner.mjs"],
+      "env": { "WA_LANE": "${WA_LANE}", "WA_TASK_ID": "${WA_TASK_ID:-}", "WA_LANE_TOKEN": "${WA_LANE_TOKEN}" }
+    },
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
+    }
+  }
+}

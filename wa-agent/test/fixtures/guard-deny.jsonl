@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","session_id":"__SID__","model":"role-exec"}
+{"type":"assistant","uuid":"u-gd-1","session_id":"__SID__","message":{"id":"msg_g1","role":"assistant","content":[{"type":"tool_use","id":"toolu_k","name":"Bash","input":{"command":"kubectl delete pod x"}}]}}
+{"type":"user","session_id":"__SID__","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_k","content":"Blocked by guard (no-cluster-tools)","is_error":true}]}}
+{"type":"assistant","uuid":"u-gd-2","session_id":"__SID__","message":{"id":"msg_g2","role":"assistant","content":[{"type":"text","text":"Perintahnya gak aku jalanin: kubectl delete pod x"}]}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"__SID__","stop_reason":"end_turn","duration_ms":800,"result":"x","usage":{},"modelUsage":{},"permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_k","tool_input":{"command":"kubectl delete pod x"}}]}

@@ -7,7 +7,13 @@ on:
   # Catatan: GitHub menonaktifkan workflow terjadwal setelah 60 hari tanpa aktivitas repo.
   schedule:
     - cron: "17 17 * * *"
+  # Tanpa input: build manual seperti biasa. Dengan `digest`: hanya job promote-wa (tag rilis wa-*), tanpa build dan retensi.
   workflow_dispatch:
+    inputs:
+      digest:
+        description: "promote-wa: digest image (sha256:...) yang selftest Job-nya lulus; kosongkan untuk build manual"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -15,6 +21,7 @@ permissions:
 
 jobs:
   build:
+    if: ${{ inputs.digest == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +55,7 @@ jobs:
   # Prasyarat sekali: package agent-runtime > Package settings > Manage Actions access > tambah repo ini dengan role Admin.
   retention:
     needs: build
+    if: ${{ inputs.digest == '' }}
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -60,10 +68,54 @@ jobs:
           account: user
           token: ${{ secrets.GITHUB_TOKEN }}
           image-names: agent-runtime
-          image-tags: "*"
+          # "!wa-*" = jangan sentuh versi bertag wa-* (rilis Gremio dari promote-wa). Bentuk `!` sesuai README action (contoh "!prod !qa").
+          # BELUM TERBUKTI: apakah versi yang membawa tag tanggal DAN wa-* ikut dipertahankan; cek log dry-run sebelum RETENTION_LIVE=true.
+          image-tags: "!wa-*"
           tag-selection: both
           keep-n-most-recent: 14
           # Versi yang baru dibuat (child manifest belum bertag) tidak disentuh.
           cut-off: 1h
           timestamp-to-use: created_at
           dry-run: ${{ vars.RETENTION_LIVE != 'true' }}
+
+  # Rilis Gremio: hanya memberi tag wa-<YYYYMMDD>-<sha7> pada digest yang SUDAH lulus selftest Job di cluster (PLAN phase 3).
+  # Tidak membangun ulang dan tidak memakai `imagetools create` (bisa menulis digest index baru dan meninggalkan yang diuji tanpa tag).
+  # <YYYYMMDD>-<sha7> diambil dari tag build (YYYYMMDD-HHMMSS-sha7) yang digest-nya sama dengan input, bukan dari GITHUB_SHA saat dispatch.
+  promote-wa:
+    if: ${{ inputs.digest != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    concurrency:
+      group: ghcr-retention
+      cancel-in-progress: false
+    steps:
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag the tested digest and verify it did not move
+        env:
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          set -euo pipefail
+          IMG=ghcr.io/faisalcayunda/agent-runtime
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "digest must look like sha256:<64 hex>"; exit 1; }
+          crane manifest "$IMG@$DIGEST" >/dev/null || { echo "no such digest in $IMG"; exit 1; }
+          src=""
+          while read -r t; do
+            [[ "$t" =~ ^([0-9]{8})-[0-9]{6}-([0-9a-f]{7})$ ]] || continue
+            if [ "$(crane digest "$IMG:$t")" = "$DIGEST" ]; then src="wa-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"; break; fi
+          done < <(crane ls "$IMG")
+          [ -n "$src" ] || { echo "no build tag (YYYYMMDD-HHMMSS-sha7) points at $DIGEST; it may be past retention or not a build of main"; exit 1; }
+          if existing="$(crane digest "$IMG:$src" 2>/dev/null)" && [ "$existing" != "$DIGEST" ]; then
+            echo "$src already exists on another digest ($existing); refusing to move a release tag"; exit 1
+          fi
+          crane tag "$IMG@$DIGEST" "$src"
+          got="$(crane digest "$IMG:$src")"
+          [ "$got" = "$DIGEST" ] || { echo "digest changed after tagging: $got"; exit 1; }
+          echo "tagged $IMG:$src -> $got"
+          echo "Release tag: \`$src\` ($got)" >> "$GITHUB_STEP_SUMMARY"

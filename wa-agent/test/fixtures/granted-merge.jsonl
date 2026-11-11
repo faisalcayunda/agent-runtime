@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"__SID__","model":"role-exec"}
+{"type":"assistant","uuid":"u-gm-1","session_id":"__SID__","message":{"id":"msg_m1","role":"assistant","content":[{"type":"tool_use","id":"toolu_merge","name":"Bash","input":{"command":"gh pr merge https://github.com/o/r/pull/7 --squash"}}]}}
+{"type":"user","session_id":"__SID__","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_merge","content":"merged","is_error":false}]}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"__SID__","stop_reason":"end_turn","duration_ms":500,"result":"ok","usage":{},"modelUsage":{},"permission_denials":[]}

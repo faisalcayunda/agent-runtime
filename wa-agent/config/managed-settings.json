@@ -1,0 +1,48 @@
+{
+  "allowManagedHooksOnly": true,
+  "disableAllHooks": false,
+  "allowManagedPermissionRulesOnly": true,
+  "autoMemoryEnabled": true,
+  "autoMemoryDirectory": "~/.claude/agent-memory",
+  "cleanupPeriodDays": 180,
+  "deniedModels": ["fable"],
+  "permissions": {
+    "deny": [
+      "Edit(~/.claude/settings*.json)",
+      "Edit(~/.claude.json)",
+      "Edit(//opt/**)",
+      "Edit(//etc/**)",
+      "Edit(//xchg/answers/**)",
+      "Edit(//xchg/grants/**)"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 /opt/wa-agent/hooks/wiki-retrieve.py", "timeout": 10 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          { "type": "command", "command": "node /opt/wa-agent/hooks/ask-defer.mjs", "timeout": 10 }
+        ]
+      },
+      {
+        "matcher": "^(Bash|Write|Edit|NotebookEdit|mcp__.*)$",
+        "hooks": [
+          { "type": "command", "command": "node /opt/wa-agent/hooks/guard.mjs", "timeout": 10, "onFailure": "block" }
+        ]
+      },
+      {
+        "matcher": "^(Write|Edit)$",
+        "hooks": [
+          { "type": "command", "command": "node /opt/wa-agent/hooks/secret-guard.mjs", "timeout": 15, "onFailure": "block" }
+        ]
+      }
+    ]
+  }
+}

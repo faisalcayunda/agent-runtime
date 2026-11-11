@@ -1,0 +1,11 @@
+{
+  "_note": "All fixtures are SYNTHETIC until phase 1 records real stream-json. Replace a file with its recorded twin of the same name; the placeholder __SID__ is substituted by testlib/fake-claude.mjs, recorded files do not need it.",
+  "plain.jsonl": {"origin": "synthetic", "stands_for": "T8 no-tool question"},
+  "deferred.jsonl": {"origin": "synthetic", "stands_for": "T2 step 1 (tool_deferred)"},
+  "answered.jsonl": {"origin": "synthetic", "stands_for": "T2 step 3 (resume after answer)"},
+  "parallel-deny.jsonl": {"origin": "synthetic", "stands_for": "T3 parallel call, permission tool deny, retry alone"},
+  "guard-deny.jsonl": {"origin": "synthetic", "stands_for": "T5 guard denial"},
+  "task-turn.jsonl": {"origin": "synthetic", "stands_for": "task lane turn: intermediate text plus notify_owner"},
+  "granted-merge.jsonl": {"origin": "synthetic", "stands_for": "a guard-allowed gh pr merge (grant use)"},
+  "hang.jsonl": {"origin": "synthetic", "stands_for": "turn that never ends (fake-claude sleeps until SIGTERM)"}
+}

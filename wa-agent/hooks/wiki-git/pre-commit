@@ -1,0 +1,19 @@
+#!/bin/sh
+# Pod pre-commit for the wiki clone (PLAN 2.10, S14). bin/wiki-sync.sh points core.hooksPath here on every git call.
+# Runs secret_scan.py (the pinned claude-config copy that sits in hooks/, next to secret-guard.mjs) over the staged
+# blobs. Fails closed: a missing or broken scanner rejects the commit. No baseline file is honoured: the clone's tree
+# is model-writable, so a baseline there would let a page whitelist itself.
+scan="$(dirname "$0")/../secret_scan.py"
+if [ ! -f "$scan" ]; then
+  echo "pre-commit: $scan is missing; refusing to commit" >&2
+  exit 1
+fi
+# secret_scan.py skips any file that carries its allow-file pragma near the top: a model-written page must not get that.
+if git diff --cached -U0 | grep -q '^+.*secret-scan: allow-file'; then
+  echo "pre-commit: a staged page carries the secret-scan allow-file pragma; refusing to commit" >&2
+  exit 1
+fi
+if ! python3 -I "$scan" --git-staged; then
+  echo "pre-commit: secret scan failed (or could not run); nothing committed. Remove the secret from the page." >&2
+  exit 1
+fi

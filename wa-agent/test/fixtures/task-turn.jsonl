@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","session_id":"__SID__","model":"role-exec"}
+{"type":"assistant","uuid":"u-tt-1","session_id":"__SID__","message":{"id":"msg_t1","role":"assistant","content":[{"type":"text","text":"INTERMEDIATE: lagi ngerjain, jangan dikirim ke WA"}]}}
+{"type":"assistant","uuid":"u-tt-2","session_id":"__SID__","message":{"id":"msg_t2","role":"assistant","content":[{"type":"tool_use","id":"toolu_n1","name":"mcp__owner__notify_owner","input":{"kind":"done","text":"Udah beres Lord Faisal."}}]}}
+{"type":"user","session_id":"__SID__","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_n1","content":"sent","is_error":false}]}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"__SID__","stop_reason":"end_turn","duration_ms":3000,"result":"done","usage":{},"modelUsage":{},"permission_denials":[]}
