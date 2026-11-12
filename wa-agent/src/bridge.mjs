@@ -18,6 +18,7 @@ import { parseCommand } from "./commands.mjs";
 import { questionsOf } from "./stream.mjs";
 import { attach, send } from "./ipc.mjs";
 import { MEDIA_CAPS, messageId } from "./wa.mjs";
+import { createHealth, httpGet } from "./health.mjs";
 import { groupLaneId, inside, isGroupLane, validFile, validId } from "./ids.mjs";
 
 const MAX_TEXT = 4000; // WhatsApp message length we split at (UNVERIFIED limit, PLAN 2.2 step 4)
@@ -557,6 +558,7 @@ async function main() {
   const lib = await import("@whiskeysockets/baileys");
   const { createWa, parseGroups, parseOwners, ProxyAgent } = await import("./wa.mjs");
   const proxy = env.HTTPS_PROXY || env.https_proxy;
+  const agent = proxy ? new ProxyAgent(proxy) : undefined; // the one proxy agent: Baileys and the health ping
 
   const groups = parseGroups(env.WA_GROUP_JIDS); // family groups: any member may address Gremio there (PLAN 2.13)
   let conn = null, core = null;
@@ -564,11 +566,13 @@ async function main() {
   const polls = { get: (id) => state.d.polls[id]?.raw };
   const wa = createWa({
     lib, owners: parseOwners(owner), groups, ownerJid: owner.split(",")[0], authDir: join(dir, "auth"), xchg, polls,
-    logger: pino({ level: env.WA_LOG_LEVEL ?? "warn" }), agent: proxy ? new ProxyAgent(proxy) : undefined,
+    logger: pino({ level: env.WA_LOG_LEVEL ?? "warn" }), agent,
     fetchVersion: env.WA_FETCH_VERSION !== "0", qr: (q) => qrt.generate(q, { small: true }), log,
     onMessage: (n) => core.onMessage(n), onVote: (v) => core.onVote(v), onOpen: () => core.onOpen(),
   });
   core = createCore({ state, xchg, wa, toRunner, groups, log });
+  const health = createHealth({ url: env.PING_BRIDGE_URL, isOpen: () => wa.isOpen(), get: (u) => httpGet(u, { agent }), log });
+  health.start();
   core.sweep();
   setInterval(() => core.sweep(), 3600 * 1000).unref();
 
@@ -587,7 +591,7 @@ async function main() {
 
   await wa.start();
   // SIGTERM: stop taking messages, let the runner finish the turn up to 20 s, then cancel (PLAN phase 2 table).
-  process.on("SIGTERM", () => { wa.stop(); send(conn, { op: "shutdown", graceMs: 20000 }); setTimeout(() => process.exit(0), 25000).unref(); });
+  process.on("SIGTERM", () => { health.stop(); wa.stop(); send(conn, { op: "shutdown", graceMs: 20000 }); setTimeout(() => process.exit(0), 25000).unref(); });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch((e) => { process.stderr.write(`bridge: ${e.stack}\n`); process.exit(1); });

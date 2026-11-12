@@ -94,3 +94,15 @@ test("--once CLI mode reads the registry from HOME and writes events under WA_XC
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(P.events(), ["t1-d1.json"]);
 });
+
+test("a group lane's tracked issues are polled and their events name the group lane", async () => {
+  const P = setup();
+  writeFileSync(P.cfg.regPath, JSON.stringify({ lanes: {}, groups: { grp_120363: { since: SINCE, tracked: [{ id: "c7", role: "child", since: SINCE }] } }, waiting: [] }));
+  P.put("comments-c7.json", [{ id: "a1", author_type: "agent", content: "Saran dari Riou", created_at: "2026-11-11T10:05:00Z" }]);
+  P.put("issue-c7.json", { status: "done" });
+  assert.deepEqual(await pollOnce(P.cfg), ["c7-a1.json", "c7-status-done.json"]);
+  const ev = JSON.parse(readFileSync(join(P.cfg.eventsDir, "c7-a1.json"), "utf8"));
+  assert.deepEqual([ev.task, ev.issue, ev.text], ["grp_120363", "c7", "Saran dari Riou"]);
+  assert.ok(P.calls().every((c) => !c.includes("grp_120363"))); // the lane id is not an issue
+  assert.deepEqual(await pollOnce(P.cfg), []);
+});

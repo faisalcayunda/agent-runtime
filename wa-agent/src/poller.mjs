@@ -29,9 +29,11 @@ export async function pollOnce({ bin = "multica", regPath, seenPath, eventsDir, 
   const reg = readJson(regPath, { lanes: {} });
   const seen = readJson(seenPath, {}); // issue -> {comments: [ids], cursor: iso, status: last status reported}
   const written = [];
-  for (const [task, lane] of Object.entries(reg.lanes ?? {})) {
+  // Task lanes (their own issue plus tracked ones) and group lanes (tracked issues only; the event's `task` is the group lane id).
+  const owners = [...Object.entries(reg.lanes ?? {}).map(([k, l]) => [k, l, true]), ...Object.entries(reg.groups ?? {}).map(([k, l]) => [k, l, false])];
+  for (const [task, lane, hasIssue] of owners) {
     if (lane.done) continue;
-    const issues = [{ id: task, role: "task", since: lane.since }, ...(lane.tracked ?? [])];
+    const issues = [...(hasIssue ? [{ id: task, role: "task", since: lane.since }] : []), ...(lane.tracked ?? [])];
     for (const it of issues) {
       if (!ID_RE.test(String(it.id))) continue;
       const st = (seen[it.id] ??= { comments: [], cursor: it.since ?? new Date(0).toISOString(), status: null });

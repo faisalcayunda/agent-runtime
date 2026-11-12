@@ -368,17 +368,57 @@ test("start_task from a group lane: refused unless the triggering sender is the 
   await R2.runner.close();
 });
 
-test("a group lane cannot ask the owner, notify him, track issues or run the wiki sync", async () => {
+test("a group lane cannot ask the owner, notify him or run the wiki sync", async () => {
   const S = sandbox();
   const R = await startRunner(S, { script: ["hang"] });
   const b = await connect(R.sock, { role: "bridge" });
   turn(b, { lane: GL, group: true, fromOwner: true, prompt: "[Faisal (owner)] x", session: null });
   await waitFor(() => R.calls().length === 1);
-  for (const [op, payload] of [["ask_owner", { question: "boleh?" }], ["notify", { kind: "done", text: "x" }], ["notify", { kind: "critical", text: "x", code: "k7q-4821" }], ["track_issue", { issue: "i1" }], ["wiki_capture", {}]]) {
+  for (const [op, payload] of [["ask_owner", { question: "boleh?" }], ["notify", { kind: "done", text: "x" }], ["notify", { kind: "critical", text: "x", code: "k7q-4821" }], ["wiki_capture", {}]]) {
     const r = await toolCall(R, GL, op, payload);
     assert.equal(r.ok, false, op);
   }
   assert.deepEqual(b.of("ask").concat(b.of("notify")), []);
+  await R.runner.close();
+});
+
+test("track_issue from a group lane works only for an owner-started turn, and the poller registry names that group lane", async () => {
+  const S = sandbox();
+  const R = await startRunner(S, { script: ["hang", "hang"] });
+  const b = await connect(R.sock, { role: "bridge" });
+  const reg = () => JSON.parse(readFileSync(join(S.home, ".wa-runner", "registry.json"), "utf8"));
+  turn(b, { lane: GL, group: true, fromOwner: false, prompt: "[Budi] gremio tracking dong", session: null });
+  await waitFor(() => R.calls().length === 1);
+  const refused = await toolCall(R, GL, "track_issue", { issue: "child-1", role: "child" });
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /owner/);
+  assert.ok(!existsSync(join(S.home, ".wa-runner", "registry.json")) || !reg().groups?.[GL]); // nothing registered
+  b.send({ op: "stop" });
+  await b.wait((e) => e.ev === "result");
+  turn(b, { lane: GL, group: true, fromOwner: true, prompt: "[Faisal (owner)] gremio tanya Riou", session: null });
+  await waitFor(() => R.calls().length === 2);
+  assert.equal((await toolCall(R, GL, "track_issue", { issue: "child-1", role: "child" })).ok, true);
+  assert.equal((await toolCall(R, GL, "track_issue", { issue: "child-1" })).ok, true); // idempotent
+  assert.equal((await toolCall(R, GL, "track_issue", { issue: "../x" })).ok, false);
+  assert.deepEqual(reg().groups[GL].tracked.map((t) => [t.id, t.role]), [["child-1", "child"]]);
+  assert.deepEqual(reg().lanes, {}); // a group lane takes no task slot
+  assert.equal((await toolCall(R, GL, "notify", { kind: "done", text: "x" })).ok, false); // the rest stays closed
+  await R.runner.close();
+});
+
+test("a Dunan event for an issue a group lane tracks reaches the bridge with that group lane as task", async () => {
+  const S = sandbox();
+  const R = await startRunner(S, { script: ["hang"] });
+  const b = await connect(R.sock, { role: "bridge" });
+  turn(b, { lane: GL, group: true, fromOwner: true, prompt: "[Faisal (owner)] x", session: null });
+  await waitFor(() => R.calls().length === 1);
+  await toolCall(R, GL, "track_issue", { issue: "child-1" });
+  writeFileSync(join(S.xchg, "events", "child-1-c1.json"), JSON.stringify({ task: GL, issue: "child-1", kind: "comment", comment_id: "c1", text: "Saran: pakai A" }));
+  writeFileSync(join(S.xchg, "events", "other-c2.json"), JSON.stringify({ task: "grp_555", issue: "other", kind: "comment", comment_id: "c2", text: "x" }));
+  const d = await b.wait((e) => e.ev === "dunan");
+  assert.deepEqual([d.task, d.file], [GL, "child-1-c1.json"]);
+  assert.match(d.prompt, /^\[dunan\]/);
+  await waitFor(() => !existsSync(join(S.xchg, "events", "other-c2.json"))); // a group lane nobody registered is stale
   await R.runner.close();
 });
 

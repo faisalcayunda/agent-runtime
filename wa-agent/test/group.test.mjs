@@ -248,6 +248,29 @@ test("events from a group lane cannot reach the owner: ask, notify, task-started
   assert.equal(b.state.d.lanes.grp_999, undefined);
 });
 
+test("a Dunan wake-up for an issue a group lane tracks starts a [dunan] turn on that group lane, replies go to that group, and it is not owner-started", async () => {
+  const S = sandbox();
+  const b = mk(S, { groups: new Set() });
+  await up(b);
+  await b.core.onMessage(gmsg("g1", "gremio kasih ke Riou", { jid: OTHER, fromOwner: true, family: false, name: "Faisal" }));
+  assert.equal(b.turns()[0].fromOwner, true);
+  await b.core.onRunnerEvent(result(LO));
+  const ev = { ev: "dunan", file: "child-1-c1.json", task: LO, prompt: "[dunan] Update on Multica issue child-1 (comment).\n<<<DATA\nSaran: pakai A\nDATA>>>" };
+  await b.core.onRunnerEvent(ev);
+  await b.core.onRunnerEvent(ev); // redelivered: still one turn
+  const dunan = b.turns().filter((t) => t.prompt.startsWith("[dunan]"));
+  assert.equal(dunan.length, 1);
+  assert.deepEqual([dunan[0].lane, dunan[0].group, dunan[0].fromOwner], [LO, true, false]);
+  assert.equal(b.ops("ack").length, 2);
+  await b.core.onRunnerEvent({ ev: "text", lane: LO, key: "k9", text: "Riou bilang pakai A." });
+  await b.core.onRunnerEvent(result(LO));
+  assert.deepEqual(b.wa.texts, []);
+  assert.deepEqual(b.wa.groupTexts.map((g) => [g.jid, g.text]), [[OTHER, "Riou bilang pakai A."]]);
+  // an event for a group lane the bridge never saw is dropped, not turned into a lane
+  await b.core.onRunnerEvent({ ev: "dunan", file: "x-c2.json", task: "grp_777", prompt: "[dunan] x" });
+  assert.equal(b.state.d.lanes.grp_777, undefined);
+});
+
 test("a turn error on a group lane is told to the owner, never to the group", async () => {
   const S = sandbox();
   const b = mk(S);
