@@ -2,11 +2,13 @@
 // Bridge core with a fake socket and fake timers, plus a real runner with a stub `ffmpeg` on PATH.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createCore, mediaNotes } from "../src/bridge.mjs";
 import { openState } from "../src/state.mjs";
 import { fakeBin, sandbox, tmp, waitFor } from "../testlib/helpers.mjs";
+import { attach } from "../src/ipc.mjs";
 import { connect, startRunner } from "../testlib/harness.mjs";
 
 const FAM = "120363@g.us", OTHER = "120999@g.us", LF = "grp_120363";
@@ -23,23 +25,41 @@ function fakeWa() {
   w.isOpen = () => w.open;
   return w;
 }
-// Timers the test fires by hand: nothing waits 15 s.
+const flush = () => new Promise((r) => setImmediate(r));
+// Timers the test controls: fire() runs every live one now (nothing waits 60 s); advance(ms) moves a virtual clock and runs those that fall due.
 function fakeTimers() {
   const list = [];
-  return {
+  let clock = 0;
+  const T = {
     list,
-    setTimer: (f, ms) => { const t = { f, ms, off: false }; list.push(t); return t; },
+    setTimer: (f, ms) => { const t = { f, ms, at: clock + ms, off: false }; list.push(t); return t; },
     clearTimer: (t) => { t.off = true; },
     live: () => list.filter((t) => !t.off),
-    async fire() { for (const t of list.filter((x) => !x.off)) { t.off = true; await t.f(); } },
+    async fire() { for (const t of list.filter((x) => !x.off)) { t.off = true; await t.f(); } await flush(); },
+    async advance(ms) {
+      const end = clock + ms;
+      for (;;) {
+        const due = list.filter((t) => !t.off && t.at <= end).sort((a, b) => a.at - b.at)[0];
+        if (!due) break;
+        clock = Math.max(clock, due.at);
+        due.off = true;
+        await due.f();
+        await flush();
+      }
+      clock = end;
+    },
   };
+  return T;
 }
-function mk(S, { groups = new Set([FAM]), statusMs = 30, reactMs = 0 } = {}) {
+// reactMs: 0 = at once; null = the production default (30 s). ackTextMs defaults to production's 8 s.
+function mk(S, { groups = new Set([FAM]), statusMs = 30, reactMs = 0, ...more } = {}) {
   const wa = fakeWa(), sent = [], T = fakeTimers(), clock = { t: 1_800_000_000_000 };
   const state = openState(join(S.dir, "bridge", "state.json"));
-  const core = createCore({ state, xchg: S.xchg, wa, groups, statusMs, setTimer: T.setTimer, clearTimer: T.clearTimer, reactMs, toRunner: (m) => sent.push(m), now: () => (clock.t += 1000) });
+  const core = createCore({ state, xchg: S.xchg, wa, groups, statusMs, setTimer: T.setTimer, clearTimer: T.clearTimer, ...(reactMs === null ? {} : { reactMs }), ...more, toRunner: (m) => sent.push(m), now: () => (clock.t += 1000) });
   return { core, wa, sent, state, T, clock, turns: () => sent.filter((m) => m.op === "turn") };
 }
+// The ack timer fires, the runner never answers, the 8 s wait runs out: the fixed line goes out.
+const fixedAck = async (b) => { await b.T.fire(); await b.T.fire(); };
 const up = async (b) => { await b.core.onOpen(); await b.core.onRunnerEvent({ ev: "hello", busy: [] }); };
 const dm = (id, text, extra = {}) => ({ id, ts: T0 + 1, text, key: KEY(id), ...extra });
 const gmsg = (id, text, { jid = FAM, fromOwner = false, family = jid === FAM, extra = {} } = {}) =>
@@ -51,16 +71,19 @@ const ACKS = ["Oke, lagi aku kerjain ya.", "Siap, bentar ya, lagi aku cek.", "Si
 
 // ---------- 1. acknowledge work ----------
 
-test("ack: an owner DM is reacted to at once; after 15 s without text one short line follows, once", async () => {
+test("ack: an owner DM is reacted to at once; after 60 s without text the runner is asked, and the fixed line follows when it never answers, once", async () => {
   const S = sandbox();
   const b = mk(S);
   await up(b);
   await b.core.onMessage(dm("m1", "tolong cek deploy"));
   assert.deepEqual(b.wa.reacts, [{ key: KEY("m1") }]);            // at once, no jid: the owner
   assert.equal(b.turns().length, 1);
-  assert.deepEqual(b.T.live().map((t) => t.ms), [15000]);          // armed when the turn started
+  assert.deepEqual(b.T.live().map((t) => t.ms), [60000]);          // armed when the turn started
   assert.deepEqual(b.wa.texts, []);
   await b.T.fire();
+  assert.deepEqual(b.sent.filter((m) => m.op === "ack-text").map((m) => [m.lane, m.text]), [["chat", "tolong cek deploy"]]);
+  assert.deepEqual(b.wa.texts, []);                                // waiting for the runner
+  await b.T.fire();                                                // 8 s pass
   assert.equal(b.wa.texts.length, 1);
   assert.ok(ACKS.includes(b.wa.texts[0].text));
   assert.equal(b.wa.groupTexts.length, 0);
@@ -73,7 +96,7 @@ test("ack: an owner DM is reacted to at once; after 15 s without text one short 
 
 test("ack: the line is picked by message id, and no ack once text arrived or the turn ended", async () => {
   const S = sandbox();
-  const lineFor = async (id) => { const b = mk(sandbox()); await up(b); await b.core.onMessage(dm(id, "x")); await b.T.fire(); return b.wa.texts[0].text; };
+  const lineFor = async (id) => { const b = mk(sandbox()); await up(b); await b.core.onMessage(dm(id, "x")); await fixedAck(b); return b.wa.texts[0].text; };
   assert.equal(await lineFor("same-id"), await lineFor("same-id"));
   assert.equal(new Set(await Promise.all(Array.from({ length: 24 }, (_, i) => lineFor(`id-${i}`)))).size > 1, true);
   const b = mk(S);
@@ -102,11 +125,13 @@ test("ack: messages batched into one turn get one ack; a queued message is acked
   await b.core.onMessage(dm("m3", "tiga"));
   assert.equal(b.wa.reacts.length, 3);                             // every message gets its reaction
   assert.equal(b.turns().length, 1);
-  await b.T.fire();
+  await fixedAck(b);
   assert.equal(b.wa.texts.length, 1);
   await b.core.onRunnerEvent(result("chat"));                      // m2 and m3 run together now
   assert.equal(b.turns().length, 2);
   assert.equal(b.T.live().length, 1);
+  await b.T.fire();
+  assert.equal(b.sent.filter((m) => m.op === "ack-text").at(-1).text, "dua\ntiga");  // both messages of the batch describe the work
   await b.T.fire();
   assert.equal(b.wa.texts.length, 2);
   assert.notEqual(b.wa.texts[0].id, b.wa.texts[1].id);
@@ -139,7 +164,7 @@ test("ack: a runner that restarts and resumes the turn sends no ack", async () =
   const b = mk(S);
   await up(b);
   await b.core.onMessage(dm("m1", "kerjain"));
-  await b.T.fire();
+  await fixedAck(b);
   b.wa.texts.length = 0;
   await b.core.onRunnerEvent({ ev: "hello", busy: [] });          // the turn died with the runner: resumed without an id
   assert.equal(b.turns().length, 2);
@@ -156,7 +181,7 @@ test("ack: an addressed family-group message is reacted to in its group and acke
   assert.equal(b.wa.reacts.length, 1);
   assert.deepEqual([b.wa.reacts[0].jid, b.wa.reacts[0].key.id, b.wa.reacts[0].key.remoteJid], [FAM, "g1", FAM]);
   assert.equal(b.turns()[0].lane, LF);
-  await b.T.fire();
+  await fixedAck(b);
   assert.equal(b.wa.texts.length, 0);                              // never to the owner
   assert.equal(b.wa.groupTexts.length, 1);
   assert.deepEqual([b.wa.groupTexts[0].jid, ACKS.includes(b.wa.groupTexts[0].text), b.wa.groupTexts[0].quote.key.id], [FAM, true, "g1"]);
@@ -165,11 +190,11 @@ test("ack: an addressed family-group message is reacted to in its group and acke
   assert.equal(b.wa.groupTexts.length, 2);
 });
 
-test("ack: with reactMs 5000 the reaction waits; a reply text cancels it, silence lets it through (DM and family group)", async () => {
+test("ack: the reaction waits 30 s; a reply text cancels it, silence lets it through (DM and family group)", async () => {
   const S = sandbox();
-  const b = mk(S, { reactMs: 5000 });
+  const b = mk(S, { reactMs: null });
   await up(b);
-  const armed = () => b.T.live().filter((t) => t.ms === 5000).length;
+  const armed = () => b.T.live().filter((t) => t.ms === 30000).length;
   // DM
   await b.core.onMessage(dm("m1", "cek"));
   assert.deepEqual(b.wa.reacts, []);                               // not at once
@@ -181,7 +206,7 @@ test("ack: with reactMs 5000 the reaction waits; a reply text cancels it, silenc
   await b.core.onRunnerEvent(result("chat"));
   await b.core.onMessage(dm("m2", "lagi"));
   assert.equal(armed(), 1);
-  await b.T.fire();                                                // 5 s pass with no reply
+  await b.T.fire();                                                // 30 s pass with no reply
   assert.deepEqual(b.wa.reacts, [{ key: KEY("m2") }]);
   await b.core.onRunnerEvent(result("chat"));
   // family group
@@ -401,4 +426,279 @@ test("bridge /status: a running lane shows minutes and its last action; without 
   await ask("c3");
   assert.equal(b.sent.length, n);
   assert.match(b.wa.texts.at(-1).text, /chat: diam/);
+});
+
+// ---------- 5. generated ack line (owner 2026-11-12): the runner writes it, the bridge falls back to the fixed lines ----------
+
+const askOf = (b) => b.sent.filter((m) => m.op === "ack-text").at(-1);
+const askAt60 = async (b) => { await b.T.advance(60000); return askOf(b); };
+const FIXED = (b) => ACKS.includes(b.wa.texts.at(-1)?.text);
+
+test("ack timing: the 👀 comes at 30 s and not before; the runner is asked at 60 s and not before", async () => {
+  const b = mk(sandbox(), { reactMs: null });
+  await up(b);
+  await b.core.onMessage(dm("m1", "tolong cek deploy"));
+  assert.deepEqual(b.T.live().map((t) => t.ms).sort((x, y) => x - y), [30000, 60000]);
+  await b.T.advance(29999);
+  assert.deepEqual(b.wa.reacts, []);
+  await b.T.advance(1);
+  assert.deepEqual(b.wa.reacts, [{ key: KEY("m1") }]);
+  await b.T.advance(29999);                                        // 59.999 s
+  assert.equal(askOf(b), undefined);
+  await b.T.advance(1);                                            // 60 s
+  assert.deepEqual([askOf(b).lane, askOf(b).text], ["chat", "tolong cek deploy"]);
+  assert.equal(b.sent.filter((m) => m.op === "ack-text").length, 1);
+});
+
+test("ack text: the generated line is sent when the runner answers in time; quotes are stripped; the 8 s wait is dropped", async () => {
+  const b = mk(sandbox());
+  await up(b);
+  await b.core.onMessage(dm("m1", "tolong cek deploy"));
+  const q = await askAt60(b);
+  assert.ok(q.id);
+  await b.core.onRunnerEvent({ ev: "ack-text", id: "wrong-id", text: "salah" });   // not ours: ignored
+  assert.deepEqual(b.wa.texts, []);
+  await b.core.onRunnerEvent({ ev: "ack-text", id: q.id, text: '  "Lagi aku cek status deploy-nya."  ' });
+  await flush();
+  assert.deepEqual(b.wa.texts.map((t) => t.text), ["Lagi aku cek status deploy-nya."]);
+  assert.deepEqual(b.T.live(), []);                                // the 8 s timer was cleared, nothing else pending
+  await b.T.advance(20000);
+  assert.equal(b.wa.texts.length, 1);
+  await b.core.onRunnerEvent({ ev: "ack-text", id: q.id, text: "dobel" });           // a second answer to the same request does nothing
+  await flush();
+  assert.equal(b.wa.texts.length, 1);
+});
+
+test("ack text: no answer within 8 s, or the runner is down, sends the fixed line", async () => {
+  const b = mk(sandbox());
+  await up(b);
+  await b.core.onMessage(dm("m1", "cek"));
+  await askAt60(b);
+  assert.deepEqual(b.T.live().map((t) => t.ms), [8000]);
+  await b.T.advance(7999);
+  assert.deepEqual(b.wa.texts, []);
+  await b.T.advance(1);
+  assert.equal(b.wa.texts.length, 1);
+  assert.ok(FIXED(b));
+  // a late answer from the runner is dropped
+  await b.core.onRunnerEvent({ ev: "ack-text", id: askOf(b).id, text: "telat" });
+  await flush();
+  assert.equal(b.wa.texts.length, 1);
+  // runner down at 60 s: no request at all, the fixed line goes at once
+  const d = mk(sandbox());
+  await up(d);
+  await d.core.onMessage(dm("m1", "cek"));
+  d.core.onRunnerDown();
+  await d.T.advance(60000);
+  assert.equal(askOf(d), undefined);
+  assert.ok(FIXED(d));
+});
+
+test("ack text: an HTTP failure at the runner (null), a line over 140 chars, a multi-line line or a non-string falls back to the fixed line", async () => {
+  for (const reply of [null, "x".repeat(141), "Baris satu.\nBaris dua.", "Lagi ngecek — bentar.", "   ", 42, undefined]) {
+    const b = mk(sandbox());
+    await up(b);
+    await b.core.onMessage(dm("m1", "cek"));
+    const q = await askAt60(b);
+    await b.core.onRunnerEvent({ ev: "ack-text", id: q.id, ...(reply === undefined ? {} : { text: reply }) });
+    await flush();
+    assert.equal(b.wa.texts.length, 1, `reply ${JSON.stringify(reply)}`);
+    assert.ok(FIXED(b), `reply ${JSON.stringify(reply)} gave ${b.wa.texts[0]?.text}`);
+  }
+  const b = mk(sandbox());                                         // exactly 140 characters is fine
+  await up(b);
+  await b.core.onMessage(dm("m1", "cek"));
+  await b.core.onRunnerEvent({ ev: "ack-text", id: (await askAt60(b)).id, text: "y".repeat(140) });
+  await flush();
+  assert.deepEqual(b.wa.texts.map((t) => t.text), ["y".repeat(140)]);
+});
+
+test("ack text: no ack when reply text came first, also while the runner is still writing the line", async () => {
+  const b = mk(sandbox());
+  await up(b);
+  await b.core.onMessage(dm("m1", "cek"));
+  await b.core.onRunnerEvent({ ev: "text", lane: "chat", text: "ini hasilnya", key: "k1" });
+  await b.T.advance(120000);
+  assert.equal(askOf(b), undefined);                               // cancelled before 60 s: the runner is not even asked
+  assert.deepEqual(b.wa.texts.map((t) => t.text), ["ini hasilnya"]);
+  await b.core.onRunnerEvent(result("chat"));
+  await b.core.onMessage(dm("m2", "lagi"));
+  const q = await askAt60(b);
+  await b.core.onRunnerEvent({ ev: "text", lane: "chat", text: "beres", key: "k2" });  // arrives while the ack text is awaited
+  await b.core.onRunnerEvent({ ev: "ack-text", id: q.id, text: "Lagi aku cek." });
+  await b.T.advance(20000);
+  assert.deepEqual(b.wa.texts.map((t) => t.text), ["ini hasilnya", "beres"]);
+  // the turn ends while the line is awaited: nothing goes out either
+  await b.core.onRunnerEvent(result("chat"));
+  await b.core.onMessage(dm("m3", "satu lagi"));
+  const q3 = await askAt60(b);
+  await b.core.onRunnerEvent(result("chat"));
+  await b.core.onRunnerEvent({ ev: "ack-text", id: q3.id, text: "Lagi aku cek." });
+  await b.T.advance(20000);
+  assert.deepEqual(b.wa.texts.map((t) => t.text), ["ini hasilnya", "beres"]);
+});
+
+test("ack text: the wait for the runner does not hold the serial chain (a reply text still gets through and cancels the ack)", async () => {
+  const b = mk(sandbox());
+  await up(b);
+  await b.core.onMessage(dm("m1", "cek"));
+  await askAt60(b);
+  let done = false;
+  const p = b.core.onRunnerEvent({ ev: "text", lane: "chat", text: "jawaban", key: "k1" }).then(() => { done = true; });
+  await flush();
+  assert.equal(done, true);
+  await p;
+  assert.deepEqual(b.wa.texts.map((t) => t.text), ["jawaban"]);
+});
+
+test("ack text, group: the request carries the trigger only; the generated line goes to the group quoting that message", async () => {
+  const b = mk(sandbox());
+  await up(b);
+  await b.core.onMessage(gmsg("g1", "gremio resep nasi goreng?"));
+  const q = await askAt60(b);
+  assert.equal(q.lane, LF);
+  assert.deepEqual(Object.keys(q).sort(), ["id", "lane", "op", "text"]);   // nothing else rides along
+  assert.match(q.text, /resep nasi goreng/);
+  await b.core.onRunnerEvent({ ev: "ack-text", id: q.id, text: "Lagi aku cariin resepnya." });
+  await flush();
+  assert.equal(b.wa.texts.length, 0);                              // never to the owner
+  assert.deepEqual(b.wa.groupTexts.map((t) => [t.jid, t.text, t.quote.key.id]), [[FAM, "Lagi aku cariin resepnya.", "g1"]]);
+  // fixed fallback in a group keeps the quote too
+  await b.core.onRunnerEvent(result(LF));
+  await b.core.onMessage(gmsg("g2", "gremio lagi"));
+  await b.T.advance(60000);
+  await b.T.advance(8000);
+  assert.deepEqual([b.wa.groupTexts.at(-1).quote.key.id, ACKS.includes(b.wa.groupTexts.at(-1).text)], ["g2", true]);
+});
+
+test("ack text: the trigger is capped at 500 chars; none is asked for an answer, a resume or a [dunan] event", async () => {
+  const b = mk(sandbox());
+  await up(b);
+  await b.core.onMessage(dm("m1", "k".repeat(900)));
+  assert.equal((await askAt60(b)).text.length, 500);
+  await b.core.onRunnerEvent(DEFERRED("q1", "chat"));
+  await b.core.onMessage(dm("m2", "A"));
+  await b.core.onRunnerEvent(result("chat"));
+  await b.core.onRunnerEvent({ ev: "task-started", task: "i1", prompt: "[task] i1" });
+  await b.core.onRunnerEvent({ ev: "dunan", file: "e1.json", task: "i1", prompt: "[dunan] update" });
+  const before = b.sent.filter((m) => m.op === "ack-text").length;
+  await b.T.advance(200000);
+  assert.equal(b.sent.filter((m) => m.op === "ack-text").length, before);
+});
+
+// ---- the runner side: one call to the router (fake HTTP server), the credential stays out of logs ----
+
+async function fakeRouter(t, handler) {
+  const reqs = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => { reqs.push({ method: req.method, url: req.url, headers: req.headers, body }); handler(req, res, body); });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  return { reqs, url: `http://127.0.0.1:${server.address().port}` };
+}
+const says = (text) => (req, res) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ id: "msg_1", type: "message", content: [{ type: "text", text }] })); };
+const TOKEN = "tok-SECRET-9f3a";
+
+// A runner with a running chat turn (fake claude hangs), and a bridge connection to it.
+async function runnerWithTurn(t, env, opts = {}) {
+  const S = sandbox();
+  const R = await startRunner(S, { script: ["hang"], env, ...opts });
+  const b = await connect(R.sock, { role: "bridge" });
+  turnOf(b, { prompt: "kerja", session: "S-9" });
+  await b.wait((e) => e.ev === "session");
+  const ask = async (m = {}) => { const id = `a${Math.random()}`; b.send({ op: "ack-text", id, lane: "chat", text: "tolong cek deploy", ...m }); return b.wait((e) => e.ev === "ack-text" && e.id === (m.id ?? id)); };
+  return { S, R, b, ask };
+}
+
+test("runner ack-text: one POST to $ANTHROPIC_BASE_URL/v1/messages with the CLI's credential, the lite model, 60 tokens, no memory or other lanes in the prompt", async (t) => {
+  const router = await fakeRouter(t, says('"Lagi aku cek deploy-nya."'));
+  const { S, R, ask } = await runnerWithTurn(t, { ANTHROPIC_BASE_URL: `${router.url}/`, ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite", HTTPS_PROXY: "http://127.0.0.1:1", HTTP_PROXY: "http://127.0.0.1:1", NO_PROXY: "" });
+  writeFileSync(join(S.home, ".claude", "agent-memory", "MEMORY.md"), "RAHASIA-MEMORI-OWNER\n");
+  const line = (session, subject) => JSON.stringify({ decision: "pass", tool: "Bash", subject, session_id: session, lane: "chat" }) + "\n";
+  writeFileSync(join(S.home, ".claude", "guard.log"), line("S-9", "kubectl get pods") + line("LAIN", "ambil rahasia lane lain"));
+  const r = await ask({ text: "tolong cek deploy <b>x</b>" });
+  assert.equal(r.text, "Lagi aku cek deploy-nya.");               // quotes stripped; the proxy variables were not used
+  assert.equal(router.reqs.length, 1);
+  const q = router.reqs[0];
+  assert.deepEqual([q.method, q.url], ["POST", "/v1/messages"]);
+  assert.equal(q.headers.authorization, `Bearer ${TOKEN}`);
+  assert.equal(q.headers["x-api-key"], undefined);
+  const body = JSON.parse(q.body);
+  assert.deepEqual([body.model, body.max_tokens], ["role-exec-lite", 60]);
+  assert.match(body.system, /aku/);
+  assert.match(body.system, /12 kata/);
+  const user = body.messages[0].content;
+  assert.match(user, /tolong cek deploy/);
+  assert.match(user, /kubectl get pods/);                           // this lane's own last action
+  assert.doesNotMatch(q.body, /RAHASIA|lane lain|<b>/);             // no memory, no other session, no markup from the trigger
+  assert.equal(q.body.includes(TOKEN), false);
+});
+
+test("runner ack-text: WA_ACK_MODEL wins over the haiku default; an API key goes in x-api-key; no base URL or key means null", async (t) => {
+  const router = await fakeRouter(t, says("Lagi aku cek."));
+  const a = await runnerWithTurn(t, { ANTHROPIC_BASE_URL: router.url, ANTHROPIC_API_KEY: "sk-ant-KEY", ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite", WA_ACK_MODEL: "role-other" });
+  assert.equal((await a.ask()).text, "Lagi aku cek.");
+  assert.equal(router.reqs[0].headers["x-api-key"], "sk-ant-KEY");
+  assert.equal(router.reqs[0].headers.authorization, undefined);
+  assert.equal(JSON.parse(router.reqs[0].body).model, "role-other");
+  const none = await runnerWithTurn(t, { ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite" });   // direct route: no router URL
+  assert.equal((await none.ask()).text, null);
+  assert.equal(router.reqs.length, 1);
+  const fable = await runnerWithTurn(t, { ANTHROPIC_BASE_URL: router.url, ANTHROPIC_AUTH_TOKEN: TOKEN, WA_ACK_MODEL: "Fable-5" });   // never sent to the router
+  assert.equal((await fable.ask()).text, null);
+  assert.equal(router.reqs.length, 1);
+});
+
+test("runner ack-text: HTTP errors, a hung router, bad JSON and unusable text all answer null; a lane that is not running answers null", async (t) => {
+  for (const [name, handler, opts] of [
+    ["500", (req, res) => { res.statusCode = 500; res.end("boom"); }, {}],
+    ["401 echoing the credential", (req, res) => { res.statusCode = 401; res.end(`bad key ${req.headers.authorization}`); }, {}],
+    ["not json", (req, res) => res.end("<html>"), {}],
+    ["no text block", (req, res) => res.end(JSON.stringify({ content: [{ type: "thinking" }] })), {}],
+    ["too long", says("z".repeat(141)), {}],
+    ["two lines", says("satu\ndua"), {}],
+    ["hung", () => {}, { ackHttpMs: 150 }],
+  ]) {
+    const router = await fakeRouter(t, handler);
+    const x = await runnerWithTurn(t, { ANTHROPIC_BASE_URL: router.url, ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite" }, opts);
+    const r = await x.ask();
+    assert.equal(r.text, null, name);
+    assert.equal(router.reqs.length, 1, name);
+    assert.equal(x.R.logs.join("\n").includes(TOKEN), false, `${name}: the credential reached the runner log`);
+    assert.equal(JSON.stringify(x.b.events).includes(TOKEN), false, name);
+    assert.ok(x.R.logs.some((l) => l.startsWith("ack text: ")), name);
+    if (name === "hung") assert.match(x.R.logs.join("\n"), /ack text: call failed/);
+    if (name === "500") assert.match(x.R.logs.join("\n"), /router answered 500/);
+  }
+  const router = await fakeRouter(t, says("Lagi aku cek."));
+  const x = await runnerWithTurn(t, { ANTHROPIC_BASE_URL: router.url, ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite" });
+  assert.equal((await x.ask({ lane: "nope" })).text, null);        // not running
+  assert.equal((await x.ask({ lane: 7 })).text, null);
+  assert.equal(router.reqs.length, 0);
+});
+
+test("ack text end to end: bridge core, real runner, fake router: the generated line reaches the owner; a router failure gives the fixed line", async (t) => {
+  for (const ok of [true, false]) {
+    const router = await fakeRouter(t, ok ? says("Lagi aku cek deploy-nya.") : (req, res) => { res.statusCode = 503; res.end("{}"); });
+    const S = sandbox();
+    const R = await startRunner(S, { script: ["hang"], env: { ANTHROPIC_BASE_URL: router.url, ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite" } });
+    const conn = await connect(R.sock, { role: "bridge" });
+    const b = mk(S);                                                 // its fake timers and WhatsApp; the core below talks to the real runner
+    const core = createCore({ state: openState(join(S.dir, "bridge2", "state.json")), xchg: S.xchg, wa: b.wa, setTimer: b.T.setTimer, clearTimer: b.T.clearTimer, reactMs: 0, toRunner: (m) => conn.send(m), now: () => (b.clock.t += 1000) });
+    attach(conn.socket, (ev) => { if (ev.ev === "ack-text") core.onRunnerEvent(ev); });
+    await core.onOpen();
+    await core.onRunnerEvent({ ev: "hello", busy: [] });
+    await core.onMessage(dm("m1", "tolong cek deploy"));            // the turn starts a fake claude through the socket
+    await conn.wait((e) => e.ev === "session");
+    await b.T.advance(60000);
+    await waitFor(() => b.wa.texts.length === 1);
+    if (ok) assert.deepEqual(b.wa.texts.map((x) => x.text), ["Lagi aku cek deploy-nya."]);
+    else assert.ok(ACKS.includes(b.wa.texts[0].text));
+    assert.equal(router.reqs.length, 1);
+    conn.send({ op: "stop" });
+    await conn.wait((e) => e.ev === "result");
+  }
 });

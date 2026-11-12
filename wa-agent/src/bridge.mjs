@@ -20,14 +20,18 @@ import { attach, send } from "./ipc.mjs";
 import { MEDIA_CAPS, messageId } from "./wa.mjs";
 import { createHealth, httpGet } from "./health.mjs";
 import { groupLaneId, inside, isGroupLane, validFile, validId } from "./ids.mjs";
+import { ACK_TRIGGER_MAX, cleanAck } from "./ack.mjs";
 
 const MAX_TEXT = 4000; // WhatsApp message length we split at (UNVERIFIED limit, PLAN 2.2 step 4)
 const POLL_MAX_OPTIONS = 12;
 const CODE_TTL_MS = 24 * 3600 * 1000;
 const POLL_UNREADABLE = "poll-nya gak kebaca, jawab pakai angka aja ya";
-// Acknowledge work (owner decision 2026-11-12): a reaction at once, and one short line when a turn has said nothing for ACK_MS.
-const ACK_MS = 15000;
-const REACT_MS = 5000; // the 👀 shows only when no reply came within 5 s
+// Acknowledge work (owner decision 2026-11-12): a 👀 when a turn has said nothing for REACT_MS, and one short line after ACK_MS.
+// The line is written by the runner (it alone holds a model credential) and asked for over the socket, waiting ACK_TEXT_MS;
+// without an answer in time the fixed ACK_LINES go out.
+const ACK_MS = 60000;
+const REACT_MS = 30000;
+const ACK_TEXT_MS = 8000;
 const ACK_LINES = ["Oke, lagi aku kerjain ya.", "Siap, bentar ya, lagi aku cek.", "Sip, aku proses dulu ya.", "Oke, bentar ya, lagi aku urus."];
 const ackLine = (msgId) => ACK_LINES[parseInt(messageId(`ack-line:${msgId}`).slice(2, 6), 16) % ACK_LINES.length];
 const mb = (kind) => MEDIA_CAPS[kind] / 1024 / 1024;
@@ -81,7 +85,7 @@ export function renderQuestion(head, { group = false } = {}) {
   return `${n}${q.question}${list ? "\n" + list : ""}${how}`;
 }
 
-export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, log = () => {}, setTimer = (f, ms) => { const t = setTimeout(f, ms); t.unref(); return t; }, clearTimer = clearTimeout, ackMs = ACK_MS, reactMs = REACT_MS, statusMs = 2000 }) {
+export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, log = () => {}, setTimer = (f, ms) => { const t = setTimeout(f, ms); t.unref(); return t; }, clearTimer = clearTimeout, ackMs = ACK_MS, reactMs = REACT_MS, ackTextMs = ACK_TEXT_MS, statusMs = 2000 }) {
   const S = state.d;
   const save = () => state.save();
   const known = (id) => id === "chat" || (validId(id) && !!S.lanes[id]);
@@ -146,28 +150,50 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     L.inflight = { raw, ids: items.map((i) => i.id).filter(Boolean), answered: items.find((i) => i.answered)?.answered ?? null, ...(videos.length ? { videos } : {}), ...(group ? { fromOwner: items[0].fromOwner === true } : {}) };
     if (group && items[0].quote) L.quote = items[0].quote;
     save();
-    startAck(id, items.find((i) => i.ack)?.id);
+    const acked = items.filter((i) => i.ack);
+    startAck(id, acked[0]?.id, acked.map((i) => i.text).filter(Boolean).join("\n").slice(0, ACK_TRIGGER_MAX));
     toRunner({ op: "turn", lane: id, task: id === "chat" || group ? undefined : id, session: S.sessions[id] ?? null, prompt: items.map((i) => (i.pre ? `${i.pre}\n${i.text}` : i.text)).filter(Boolean).join("\n\n"), origin: L.inflight.ids, ...(videos.length ? { videos } : {}), ...(group ? { group: true, fromOwner: L.inflight.fromOwner } : {}) });
   }
   // extra: pre (what the message replies to: for the model only, it stays out of `raw`, which grants and requeues read),
   // videos (the runner turns them into frames) and ack (a user message that gets a reaction and maybe an ack line).
   function enqueue(id, text, msgId, extra = {}) { if (!known(id)) return log(`no lane ${id}`); lane(id).queue.push({ text, id: msgId ?? null, ...extra }); save(); pump(id); }
 
-  // ---- acknowledge work: one reaction at once, one line when the turn has sent no text for ackMs (no model call) ----
-  const acks = new Map(); // lane -> {msgId, timer}: only while the turn that msgId started is running
+  // ---- acknowledge work: a 👀 and one line when the turn has sent no text for ackMs; the runner writes the line ----
+  const acks = new Map(); // lane -> {msgId, trigger, timer}: only while the turn that msgId started is running
   const cancelAck = (id) => { const a = acks.get(id); if (a) { clearTimer(a.timer); acks.delete(id); } };
-  const fireAck = serial(async (id, a) => {
+  // Asked of the runner outside the serial chain, like /status: waiting here must not hold back the "text" event that cancels the ack.
+  const ackWait = new Map(); // request id -> resolve
+  let ackSeq = 0;
+  function askAckText(id, trigger) {
+    const rid = `ak${++ackSeq}`;
+    return new Promise((res) => {
+      const t = setTimer(() => { ackWait.delete(rid); res(null); }, ackTextMs);
+      ackWait.set(rid, (text) => { clearTimer(t); res(text); });
+      toRunner({ op: "ack-text", id: rid, lane: id, text: trigger });
+    });
+  }
+  function onAckTextReply(m) {
+    const done = ackWait.get(String(m.id));
+    if (done) { ackWait.delete(String(m.id)); done(cleanAck(m.text)); } // the line is checked again here: it goes to WhatsApp from this process
+  }
+  // The check and the send share one turn of the chain: a reply text handled before it has already cancelled the ack.
+  const sendAck = serial(async (id, a, text) => {
     if (acks.get(id) !== a) return;
     acks.delete(id);
     const to = isGroupLane(id) ? laneDest(id) : null;
     if (!S.lanes[id]?.inflight || (isGroupLane(id) && !to) || wa.isOpen?.() === false) return;
-    await sendOnce(`ack:${a.msgId}`, ackLine(a.msgId), to, false); // a late ack is worse than none: no retry list
+    await sendOnce(`ack:${a.msgId}`, text ?? ackLine(a.msgId), to, false); // a late ack is worse than none: no retry list
   });
-  function startAck(id, msgId) {
+  async function fireAck(id, a) {
+    if (acks.get(id) !== a) return;
+    const text = runnerUp && S.lanes[id]?.inflight ? await askAckText(id, a.trigger) : null;
+    return sendAck(id, a, text);
+  }
+  function startAck(id, msgId, trigger = "") {
     cancelAck(id);
     if (!msgId || S.outbox[`ack:${msgId}`]) return;
-    const a = { msgId, timer: null };
-    a.timer = setTimer(() => fireAck(id, a).catch((e) => log(`ack failed: ${e.message}`)), ackMs);
+    const a = { msgId, trigger, timer: null };
+    a.timer = setTimer(() => { fireAck(id, a).catch((e) => log(`ack failed: ${e.message}`)); }, ackMs);
     acks.set(id, a);
   }
   // The 👀 waits reactMs (owner 2026-11-12): a quick reply makes it unnecessary, so any reply text on the lane cancels it.
@@ -527,7 +553,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   const runnerEvent = serial(onRunnerEvent);
   return {
     state: S,
-    onMessage: serial(onMessage), onVote: serial(onVote), onRunnerEvent: (m) => { if (m?.ev === "status") { onStatusReply(m); return Promise.resolve(); } return runnerEvent(m); }, showHead: serial(showHead),
+    onMessage: serial(onMessage), onVote: serial(onVote), onRunnerEvent: (m) => { if (m?.ev === "status") { onStatusReply(m); return Promise.resolve(); } if (m?.ev === "ack-text") { onAckTextReply(m); return Promise.resolve(); } return runnerEvent(m); }, showHead: serial(showHead),
     flushPending: serial(flushPending),
     onOpen: serial(async () => { if (!S.pairedAt) { S.pairedAt = now(); save(); } return flushPending(); }),
     onRunnerDown() { runnerUp = false; },

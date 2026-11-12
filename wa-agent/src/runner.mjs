@@ -15,6 +15,7 @@ import { LineSplitter, parseLine, pickResult } from "./stream.mjs";
 import { attach, send } from "./ipc.mjs";
 import { resetPolicy } from "./reset.mjs";
 import { inside, isGroupLane, validFile, validId } from "./ids.mjs";
+import { ACK_TRIGGER_MAX, generateAck } from "./ack.mjs";
 
 const CODE_RE = /^[a-z0-9]{3,8}-[0-9]{3,6}$/i;
 
@@ -84,6 +85,10 @@ export function createRunner(opts) {
   const eventPollMs = opts.eventPollMs ?? 3000;
   const MAX_TASK_LANES = opts.maxTaskLanes ?? maxTaskLanes(srcEnv.WA_MAX_TASK_LANES);
   const log = opts.log ?? ((m) => process.stderr.write(`runner: ${m}\n`));
+  // The progress line (owner 2026-11-12): one call to the router with the credential the claude CLI gets (token = Bearer, API key = x-api-key).
+  const ackModelRaw = opts.ackModel ?? (srcEnv.WA_ACK_MODEL || srcEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL || "");
+  const ackModel = /fable/i.test(ackModelRaw) ? "" : ackModelRaw; // no fable anywhere (buildArgv, worker-boot.sh): without a model the bridge uses its fixed line
+  const ackCred = srcEnv.ANTHROPIC_AUTH_TOKEN ? { token: srcEnv.ANTHROPIC_AUTH_TOKEN, header: "authorization" } : { token: srcEnv.ANTHROPIC_API_KEY, header: "x-api-key" };
   const doReset = opts.reset ?? (() => resetPolicy({ home, assets: { skills: join(assetsDir, "skills"), agents: join(assetsDir, "agents"), claudeMd: join(agentDir, "config", "CLAUDE.md") } }));
 
   const lanes = new Map(); // lane id -> {proc, stderr, killed}
@@ -488,6 +493,13 @@ export function createRunner(opts) {
         const out = {};
         for (const [lane, e] of lanes) out[lane] = { ms: Date.now() - e.startedAt, last: lastAction(e.sessionId) };
         return send(sock, { ev: "status", id: String(m.id ?? "").slice(0, 64), lanes: out });
+      }
+      case "ack-text": { // the line the bridge sends when a turn stays silent; null = the bridge uses its fixed line
+        const id = String(m.id ?? "").slice(0, 64), e = typeof m.lane === "string" ? lanes.get(m.lane) : null;
+        if (!e) return send(sock, { ev: "ack-text", id, text: null });
+        // Only this request's own message and this lane's own last action: nothing from memory or another lane.
+        return void generateAck({ baseUrl: srcEnv.ANTHROPIC_BASE_URL, ...ackCred, model: ackModel, trigger: typeof m.text === "string" ? m.text.slice(0, ACK_TRIGGER_MAX) : "", last: lastAction(e.sessionId), timeoutMs: opts.ackHttpMs, failed: (why) => log(`ack text: ${why}`) })
+          .then((text) => send(sock, { ev: "ack-text", id, text }));
       }
       case "ack": if (validFile(m.file)) { try { unlinkSync(inside(join(xchg, "events"), m.file)); } catch { /* gone */ } } return;
       case "grant-ack": {
