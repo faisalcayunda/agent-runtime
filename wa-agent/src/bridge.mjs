@@ -20,7 +20,7 @@ import { parseCommand } from "./commands.mjs";
 import { questionsOf } from "./stream.mjs";
 import { attach, send } from "./ipc.mjs";
 import { MEDIA_CAPS, maskJid, messageId } from "./wa.mjs";
-import { NOTES_MAX, PERSON_JID, SEND_CAPS, addPerson, addRef, cleanName, extraLines, findMsg, findRef, isEmojiOrEmpty, isWebp, mimeOf, personName, pollLine, pollResultLine, rateLimiter, readCapped, readStaged, refTable } from "./wa-actions.mjs";
+import { NOTES_MAX, PERSON_JID, SEND_CAPS, addPerson, addRef, cleanName, extraLines, findMsg, findRef, isActionNarration, isEmojiOrEmpty, isWebp, mimeOf, personName, pollLine, pollResultLine, rateLimiter, readCapped, readStaged, refTable } from "./wa-actions.mjs";
 import { createHealth, httpGet } from "./health.mjs";
 import { groupLaneId, inside, isGroupLane, validFile, validId } from "./ids.mjs";
 import { ACK_TRIGGER_MAX, REACT_TRIGGER_MAX, cleanAck, cleanEmoji } from "./ack.mjs";
@@ -574,6 +574,8 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   const OUTBOX = join(xchg, "sock", "outbox"), INBOX = join(xchg, "inbox");
   const fail = (msg) => { throw new Error(msg); };
   const keyOf = (it) => (it.mine ? { id: it.id, fromMe: true, ...(it.chat ? { remoteJid: it.chat } : {}) } : { id: it.id, remoteJid: it.chat, ...(it.from ? { participant: it.from } : {}), fromMe: false });
+  // Model-authored text that only narrates the model's own action ("(reacted 🍢)") is never sent; one log line, 40 characters of it.
+  const narration = (where, text) => { if (!isActionNarration(text)) return false; log(`dropped narration in ${where}: ${String(text).trim().slice(0, 40)}`); return true; };
   const textArg = (v, what = "text") => { const t = String(v ?? "").trim(); if (!t || t.length > MAX_TEXT) fail(`${what} must be 1 to ${MAX_TEXT} characters`); return t; };
   const escapeRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -648,6 +650,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       }
       case "reply": {
         const text = textArg(args.text), it = needRef(lane, args.ref, to);
+        if (narration(`wa_reply ${lane}`, text)) return {};
         accept();
         const r = sent(text);
         await wa.reply(text, { key: keyOf(it), message: { conversation: it.text ?? "" } }, { ...o, id });
@@ -656,7 +659,8 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       }
       case "media": {
         const kind = String(args.kind ?? "");
-        const caption = args.caption == null || kind === "sticker" ? "" : String(args.caption).trim();
+        let caption = args.caption == null || kind === "sticker" ? "" : String(args.caption).trim();
+        if (narration(`caption ${lane}`, caption)) caption = ""; // the file still goes out, without the narration
         if (caption.length > 1000) fail("caption must be at most 1000 characters");
         const { data, name } = loadFile(lane, kind, args);
         accept();
@@ -692,6 +696,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
           text = text.replace(new RegExp(escapeRe(token), "gi"), `@${jid.split("@")[0]}`);
           jids.push(jid);
         }
+        if (narration(`wa_mention ${lane}`, text)) return {};
         accept();
         const r = sent(text);
         await wa.sendMention(text, [...new Set(jids)], { ...o, id });
@@ -808,6 +813,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       case "session": { const L = lane(m.lane); if (!L.fresh && validSession(m.sessionId)) { S.sessions[m.lane] = m.sessionId; save(); } return; }
       case "text": { // a task lane's text is never sent; a group lane's goes to its own group
         if (typeof m.key !== "string" || m.key.length > 200) return;
+        if (narration(`text ${m.lane}`, m.text)) return;
         if (String(m.text ?? "").trim()) { cancelAck(m.lane); cancelReact(m.lane); }
         if (m.lane === "chat") return sendOnce(`t:${m.key}`, String(m.text ?? ""));
         const to = laneDest(m.lane);

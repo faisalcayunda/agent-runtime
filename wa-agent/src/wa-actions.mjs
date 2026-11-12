@@ -88,6 +88,17 @@ export function rateLimiter(now, table) {
 }
 
 // A reaction is one emoji, or "" to take it back.
+// A model message that only narrates its own WhatsApp action, like "(reacted 🍢)", "*mengirim stiker*" or "[sent sticker]": the whole
+// trimmed text is one short (...), [...] or *...* group that names an action word. A sentence that merely contains such a word passes.
+const NARRATION_WORD = /\b(?:react(?:s|ed|ing|ion)?|reaksi|bereaksi|stick(?:er|ers)|stiker|vote[sd]?|voting|poll(?:s|ing)?)\b/iu;
+// A generic send verb counts only next to an action noun ("(sent sticker)"), so "(Kirim aja ke aku)" stays a message.
+const SEND_WORD = /\b(?:sent|sends?|sending|mengirim|kirim|dikirim|terkirim)\b/iu;
+const ACTION_NOUN = /\b(?:stick(?:er|ers)|stiker|reaksi|reaction|emoji|poll(?:s|ing)?|gif|gambar|image|photo|foto)\b/iu;
+export function isActionNarration(text) {
+  const m = /^(?:\(([^()]*)\)|\[([^\[\]]*)\]|\*{1,2}([^*]*)\*{1,2})$/u.exec(String(text ?? "").trim());
+  const inner = (m?.[1] ?? m?.[2] ?? m?.[3] ?? "").trim();
+  return inner.length > 0 && inner.length <= 60 && !/[\n,;!?]/u.test(inner) && (NARRATION_WORD.test(inner) || (SEND_WORD.test(inner) && ACTION_NOUN.test(inner)));
+}
 export const isEmojiOrEmpty = (s) => s === "" || (typeof s === "string" && /^\p{RGI_Emoji}$/v.test(s));
 
 // ---------- what other people send, as text ----------
