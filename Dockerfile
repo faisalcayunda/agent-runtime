@@ -61,6 +61,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && ffmpeg -version | head -n1
 
+# --- Pustaka sistem Chromium untuk Playwright (agent tanpa root tidak bisa `playwright install-deps`). Hanya pustaka + font, tanpa binary browser:
+# agent mengunduh revisi yang cocok sendiri lewat `npx playwright install chromium`. Versi = @playwright/test di faisalcayunda/PoolRouter frontend. Layer sendiri, di atas cache-bust harian. ---
+ARG PLAYWRIGHT_DEPS_VERSION=1.64.1
+RUN npx -y "playwright@${PLAYWRIGHT_DEPS_VERSION}" install-deps chromium \
+    && rm -rf /var/lib/apt/lists/* /root/.npm
+
 # --- Cache-bust harian untuk semua CLI yang mengambil "latest" ---
 # Workflow mengisi CLI_REFRESH dengan tanggal UTC. ARG yang berubah membatalkan cache semua layer
 # sesudahnya, jadi layer sistem/uv/Hermes (yang dikunci) harus ada DI ATAS baris ini.
