@@ -158,7 +158,10 @@ export async function selftest(opts = {}) {
 
   const fab = t1.toolUses.find((u) => agentCall(u) && isFable(u.input.model));
   const fabRes = fab && t1.results.get(fab.id);
-  out.push(step(7, "Agent call with model fable is refused", fab && fabRes?.isError, fab ? `tool_result error=${fabRes?.isError} ${fabRes?.content?.slice(0, 80) ?? ""}` : "the model never made the call"));
+  // deniedModels may refuse the call or run it on an allowed model (seen 2026-11-12, CLI 2.1.322: it ran on the
+  // mapped combo). Either way the rule "never Fable" holds when no fable id appears in this turn's modelUsage.
+  const fabUsed = mu.some((m) => isFable(m));
+  out.push(step(7, "Agent call with model fable never runs on Fable", Boolean(fab) && (fabRes?.isError || !fabUsed), fab ? `tool_result error=${fabRes?.isError} fable in modelUsage=${fabUsed} models=[${mu.join(",")}]` : "the model never made the call"));
 
   out.push(step(8, "modelUsage: no fable id, WA_MAIN_MODEL present", mu.length > 0 && !mu.some(isFable) && mu.includes(model), `modelUsage=[${mu}] want ${model}`));
 
