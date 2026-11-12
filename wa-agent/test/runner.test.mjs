@@ -299,8 +299,8 @@ test("runner.mjs starts as a process, serves a ping on its socket and exits on S
   const child = spawn(process.execPath, [join(ROOT, "src", "runner.mjs")], { env: { HOME: S.home, PATH: process.env.PATH, WA_XCHG_DIR: S.xchg, WA_AGENT_DIR: join(S.dir, "agent"), WA_MAIN_MODEL: "role-exec" }, stdio: "ignore" });
   const exited = new Promise((res) => child.on("exit", (c, sig) => res([c, sig])));
   try {
-    await waitFor(() => existsSync(join(S.xchg, "sock", "run.sock")));
-    const b = await connect(join(S.xchg, "sock", "run.sock"), { role: "bridge" });
+    // The socket file appears at bind(), a moment before listen(): retry the connect instead of trusting existsSync.
+    const b = await waitFor(() => connect(join(S.xchg, "sock", "run.sock"), { role: "bridge" }).catch((e) => (e.code === "ECONNREFUSED" || e.code === "ENOENT" ? null : Promise.reject(e))));
     b.send({ op: "ping" });
     await b.wait((e) => e.ev === "pong");
     assert.deepEqual(b.of("hello")[0].busy, []);

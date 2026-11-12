@@ -165,6 +165,41 @@ test("ack: an addressed family-group message is reacted to in its group and acke
   assert.equal(b.wa.groupTexts.length, 2);
 });
 
+test("ack: with reactMs 5000 the reaction waits; a reply text cancels it, silence lets it through (DM and family group)", async () => {
+  const S = sandbox();
+  const b = mk(S, { reactMs: 5000 });
+  await up(b);
+  const armed = () => b.T.live().filter((t) => t.ms === 5000).length;
+  // DM
+  await b.core.onMessage(dm("m1", "cek"));
+  assert.deepEqual(b.wa.reacts, []);                               // not at once
+  assert.equal(armed(), 1);
+  await b.core.onRunnerEvent({ ev: "text", lane: "chat", text: "sudah", key: "k1" });
+  assert.equal(armed(), 0);
+  await b.T.fire();
+  assert.deepEqual(b.wa.reacts, []);                               // the reply came first: no 👀
+  await b.core.onRunnerEvent(result("chat"));
+  await b.core.onMessage(dm("m2", "lagi"));
+  assert.equal(armed(), 1);
+  await b.T.fire();                                                // 5 s pass with no reply
+  assert.deepEqual(b.wa.reacts, [{ key: KEY("m2") }]);
+  await b.core.onRunnerEvent(result("chat"));
+  // family group
+  b.wa.reacts.length = 0;
+  await b.core.onMessage(gmsg("g1", "gremio cek"));
+  assert.deepEqual(b.wa.reacts, []);
+  assert.equal(armed(), 1);
+  await b.core.onRunnerEvent({ ev: "text", lane: LF, text: "beres", key: "k2" });
+  assert.equal(armed(), 0);
+  await b.T.fire();
+  assert.deepEqual(b.wa.reacts, []);
+  await b.core.onRunnerEvent(result(LF));
+  await b.core.onMessage(gmsg("g2", "gremio lagi"));
+  assert.equal(armed(), 1);
+  await b.T.fire();
+  assert.deepEqual(b.wa.reacts.map((r) => [r.jid, r.key.id]), [[FAM, "g2"]]);
+});
+
 test("ack: no reaction or ack for a group message that never became a turn (not allowed, a command, a question's answer)", async () => {
   const S = sandbox();
   const b = mk(S);
