@@ -122,7 +122,9 @@ export async function selftest(opts = {}) {
   } finally {
     if (memBefore === null) rmSync(memory, { force: true }); else writeFileSync(memory, memBefore);
   }
-  const r1 = t1.result ?? {}, mu = perTurnModels(r1);
+  // Turn 1 is a fresh session: its cumulative modelUsage holds only this turn, including subagents whose usage can sit in an
+  // earlier result line (seen 2026-11-12: step 6 missed role-exec-lite using the since-last field alone).
+  const r1 = t1.result ?? {}, mu = [...new Set([...perTurnModels(r1), ...Object.keys(r1.modelUsage ?? {})])];
 
   const bash = t1.toolUses.find((u) => u.name === "Bash" && String(u.input.command ?? "").includes(`gremio-selftest-${nonce}`));
   let logged = false;
