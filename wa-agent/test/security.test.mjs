@@ -206,17 +206,14 @@ const gv = (S, tool, ti, over) => evaluate({ tool_name: tool, tool_input: ti, cw
 const gbash = (S, command, over) => gv(S, "Bash", { command }, over);
 const wg = (S, g) => writeFileSync(join(S.xchg, "grants", `${g.id}.json`), JSON.stringify({ created_at: Date.now(), ...g }));
 
-test("B3: an approval grant carries the verb and the comment must use that verb", () => {
+test("B3: no rule reads an approval grant or a [gremio] prefix any more: a done|deny comment passes with or without one (multica unguarded, 2026-11-12)", () => {
   const S = sandbox();
   wg(S, { id: "g1", kind: "approval", code: "abc-123", verb: "deny" });
-  const cmd = (verb) => `multica issue comment add I1 --content "[gremio] ${verb} abc-123"`;
-  assert.equal(gbash(S, cmd("done")).rule, "approval-no-grant"); // he said deny; "done" is a forgery
-  assert.deepEqual(gbash(S, cmd("deny")).grants, ["g1"]);
-  wg(S, { id: "g2", kind: "approval", code: "xyz-999", verb: "done" });
-  assert.equal(gbash(S, `multica issue comment add I1 --content "[gremio] deny xyz-999"`).rule, "approval-no-grant");
-  assert.deepEqual(gbash(S, `multica issue comment add I1 --content "[gremio] done xyz-999"`).grants, ["g2"]);
-  wg(S, { id: "g3", kind: "approval", code: "old-111" }); // a grant without a verb matches nothing
-  assert.equal(gbash(S, `multica issue comment add I1 --content "[gremio] done old-111"`).rule, "approval-no-grant");
+  for (const c of [`multica issue comment add I1 --content "[gremio] done abc-123"`, `multica issue comment add I1 --content "deny xyz-999"`, `multica issue comment add I1 --content-file body.md`]) {
+    const v = gbash(S, c);
+    assert.ok(!v?.deny, c);
+    assert.deepEqual(v?.grants ?? [], [], c); // and it uses up no grant
+  }
 });
 
 test("B4: SQL rules apply to DB clients only; MCP owner and context7 tools and commit messages are not scanned", () => {
@@ -235,7 +232,7 @@ test("B4: SQL rules apply to DB clients only; MCP owner and context7 tools and c
   const msg = gbash(S, "psql -c 'DROP TABLE x'");
   assert.match(guard.denyMessage(msg), /Lord Faisal.*notify_owner/);
   assert.doesNotMatch(guard.denyMessage(msg), /Do not retry/);
-  assert.doesNotMatch(guard.denyMessage(gbash(S, 'multica issue comment add 1 --content "hi"')), /Lord Faisal/); // a fixable denial says how to fix it
+  assert.doesNotMatch(guard.denyMessage(gbash(S, 'gh pr merge 7')), /Lord Faisal/); // a fixable denial says how to fix it
 });
 
 test("B5: every grant a command uses is returned, logged as grant_ids, and reported by the runner", async () => {

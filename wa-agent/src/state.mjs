@@ -33,10 +33,15 @@ const fresh = () => ({
   refs: {},                  // lane -> {items: [{ref, id, chat, from, mine, ...}], people: {jid: name}}: the messages a lane may act on (PLAN 2.14)
   xpolls: {},                // poll message id -> {raw, lane, ref, question, options, own, votes, ts}: polls whose votes are tallied (others' and model-made)
   notes: {},                 // lane -> [{k, ...}]: reactions, vote tallies and polls seen since the lane's last turn (PLAN 2.14)
+  rate: {},                  // destination chat ("owner" or a group jid) -> [ms of each accepted wa action in the last hour]
+  refKey: null,              // random per-bridge key of the message refs (HMAC): made on first use, never leaves this file
 });
 
-const MAPS = ["sessions", "lanes", "polls", "inbox", "outbox", "codes", "grants", "grantsUsed", "tasks", "groups", "gq", "usage", "refs", "xpolls", "notes"];
-const LIMITS = { inbox: 2000, outbox: 2000, polls: 200, xpolls: 100, grantsUsed: 500, codes: 200 };
+const MAPS = ["sessions", "lanes", "polls", "inbox", "outbox", "codes", "grants", "grantsUsed", "tasks", "groups", "gq", "usage", "refs", "xpolls", "notes", "rate"];
+// Polls that are kept for their votes: the model's own and everyone else's are capped apart, so a flood of polls in a group cannot push out
+// a poll Gremio made (and the other way round).
+export const XPOLLS_OTHERS_MAX = 60, XPOLLS_OWN_MAX = 40;
+const LIMITS = { inbox: 2000, outbox: 2000, polls: 200, grantsUsed: 500, codes: 200 };
 
 export function openState(path) {
   let d;
@@ -51,8 +56,14 @@ export function openState(path) {
     const ts = (k) => (typeof o[k] === "number" ? o[k] : o[k]?.ts ?? 0);
     keys.sort((a, b) => ts(a) - ts(b)).slice(0, keys.length - LIMITS[name]).forEach((k) => delete o[k]);
   };
+  const trimPolls = () => {
+    for (const [own, max] of [[true, XPOLLS_OWN_MAX], [false, XPOLLS_OTHERS_MAX]]) {
+      const keys = Object.keys(d.xpolls).filter((k) => (d.xpolls[k]?.own === true) === own);
+      if (keys.length > max) keys.sort((a, b) => (d.xpolls[a].ts ?? 0) - (d.xpolls[b].ts ?? 0)).slice(0, keys.length - max).forEach((k) => delete d.xpolls[k]);
+    }
+  };
   return {
     d,
-    save() { for (const n of Object.keys(LIMITS)) trim(n); safeWrite(path, JSON.stringify(d), 0o600); },
+    save() { for (const n of Object.keys(LIMITS)) trim(n); trimPolls(); safeWrite(path, JSON.stringify(d), 0o600); },
   };
 }

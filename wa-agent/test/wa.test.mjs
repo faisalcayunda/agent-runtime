@@ -193,11 +193,11 @@ test("a vote event reaches onVote with the decoded labels, or null when it canno
   const up = F.handlers["messages.upsert"];
   await up({ type: "notify", messages: [{ key: { id: "V", remoteJid: OWNER }, messageTimestamp: 1, message: { pollUpdateMessage: vote("P1").pollUpdate } }] });
   await waitFor(() => got.votes.length === 1);
-  assert.deepEqual(got.votes[0], { pollId: "P1", options: ["React"], voter: "owner", owner: true });
+  assert.deepEqual(got.votes[0], { pollId: "P1", options: ["React"], voter: "owner", owner: true, chat: null });
   F.lib.decryptPollVote = () => { throw new Error("bad"); };
   await up({ type: "notify", messages: [{ key: { id: "V2", remoteJid: OWNER }, messageTimestamp: 2, message: { pollUpdateMessage: vote("P1").pollUpdate } }] });
   await waitFor(() => got.votes.length === 2);
-  assert.deepEqual(got.votes[1], { pollId: "P1", options: null, voter: "owner", owner: true });
+  assert.deepEqual(got.votes[1], { pollId: "P1", options: null, voter: "owner", owner: true, chat: null });
   await up({ type: "notify", messages: [{ key: { id: "V3", remoteJid: "628222@s.whatsapp.net" }, messageTimestamp: 3, message: { pollUpdateMessage: vote("P1").pollUpdate } }] }); // a stranger's vote
   assert.equal(got.votes.length, 2);
 });
@@ -507,7 +507,7 @@ test("votes of group members on a kept poll are decrypted with the creator's JID
   const vote = (key, id = "P1") => ({ key: { id: "V1", remoteJid: FAM, participant: "628333@s.whatsapp.net", ...key }, messageTimestamp: 1_800_000_001, message: { pollUpdateMessage: { pollCreationMessageKey: { id, remoteJid: FAM, participant: MEMBER }, vote: { encPayload: "x", encIv: "y" } } } });
   await F.handlers["messages.upsert"]({ type: "notify", messages: [vote({}), vote({ id: "V2" }, "UNKNOWN"), vote({ participant: undefined, id: "V3" }), vote({ fromMe: true, id: "V4" })] });
   await waitFor(() => got.votes.length === 1);
-  assert.deepEqual(got.votes[0], { pollId: "P1", options: ["ikut"], voter: "628333@s.whatsapp.net", owner: false });
+  assert.deepEqual(got.votes[0], { pollId: "P1", options: ["ikut"], voter: "628333@s.whatsapp.net", owner: false, chat: FAM });
   assert.ok(tried.some((o) => o.pollCreatorJid === MEMBER)); // the creator is the member who made it, not Gremio
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(got.votes.length, 1);                          // an unknown poll, a vote with no voter and our own echo count for nothing
@@ -529,7 +529,7 @@ test("an owner's vote in another group is the voter 'owner'", async () => {
   await wa.start();
   await F.handlers["messages.upsert"]({ type: "notify", messages: [{ key: { id: "V1", remoteJid: OTHER, participant: OWNER }, messageTimestamp: 1, message: { pollUpdateMessage: { pollCreationMessageKey: { id: "P1" }, vote: { encPayload: "x", encIv: "y" } } } }] });
   await waitFor(() => got.votes.length === 1);
-  assert.deepEqual(got.votes[0], { pollId: "P1", options: ["a"], voter: "owner", owner: true });
+  assert.deepEqual(got.votes[0], { pollId: "P1", options: ["a"], voter: "owner", owner: true, chat: OTHER });
 });
 
 test("getMessage serves a kept poll of someone else, so Baileys can decrypt its votes", async () => {

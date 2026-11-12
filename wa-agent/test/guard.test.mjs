@@ -1,4 +1,4 @@
-// Guard, ask-defer hook and secret-guard tests (PLAN 2.7, 2.12, 5.2; S6, S11, S12).
+// Guard, ask-defer hook and secret-guard tests (PLAN 2.7, 2.12, 5.2; S6, S12; multica is unguarded since 2026-11-12).
 // Fields assumed from the Claude Code PreToolUse hook input (hooks.md): tool_name, tool_input.command,
 // tool_input.file_path / content / new_string / edits[].new_string, tool_input.questions, tool_use_id, cwd,
 // session_id. Output: hookSpecificOutput.permissionDecision (deny | allow | defer), updatedInput.
@@ -80,7 +80,7 @@ test("guard (spike): CLI deny is JSON on stdout and one log line, with lane and 
 });
 
 // ---- grants (S12) ----
-test("gh pr merge, git push to main and an approval comment are denied without a grant and allowed with one", () => {
+test("gh pr merge and git push to main are denied without a grant and allowed with one", () => {
   const url = "https://github.com/o/r/pull/7";
   denies(bash(`gh pr merge ${url} --squash`), "merge-no-grant");
   grantFile({ id: "g-merge", kind: "merge", url, created_at: Date.now() });
@@ -95,13 +95,6 @@ test("gh pr merge, git push to main and an approval comment are denied without a
   passes(p); assert.deepEqual(p.grants, ["g-push"]);
   denies(bash("git push origin main", { task: "task-2" }), "git-push-protected");
   denies(bash("git push origin dev"), "git-push-protected"); // the grant is for main only
-
-  const cmd = `multica issue comment add 123 --content "[gremio] done k7q-4821"`;
-  denies(bash(cmd), "approval-no-grant");
-  grantFile({ id: "g-appr", kind: "approval", code: "k7q-4821", verb: "done", created_at: Date.now() });
-  const a = bash(cmd);
-  passes(a); assert.deepEqual(a.grants, ["g-appr"]);
-  denies(bash(`multica issue comment add 123 --content "[gremio] deny zzz-1234"`), "approval-no-grant");
 });
 test("a grant expires after 24 h and honours an earlier expires_at", () => {
   const url = "https://github.com/o/r/pull/9";
@@ -118,52 +111,22 @@ test("a grant of another kind does not satisfy a merge", () => {
   denies(bash(`gh pr merge ${url}`), "merge-no-grant");
 });
 
-// ---- multica (S11) ----
-test("the guard denies Multica structure writes and comments without [gremio]", () => {
+// ---- multica (owner decision 2026-11-12: full access under Gremio's own account) ----
+test("multica is not guarded: structure writes, deletes, comments without a prefix, body from a file and a done|deny comment all pass", () => {
   for (const c of [
-    "multica skill create --name x", "multica skill update s1 --content y", "multica autopilot create x",
-    "multica runtime delete r1", "multica squad create x", "multica squad update s1", "multica workspace create x",
-    "multica --profile dev agent delete a1", "multica --workspace-id w1 project delete p1", "multica issue delete 1",
-    "multica issue comment delete c1",
-  ]) denies(bash(c));
-  denies(bash(`multica issue comment add 1 --content "hello"`), "multica-comment-prefix");
-  denies(bash(`multica issue comment add 1 --content "x [gremio]"`), "multica-comment-prefix");
-  denies(bash(`multica issue comment update c1 --content "plain"`), "multica-comment-prefix");
-  denies(bash(`multica issue comment add 1 --content-file body.md`), "multica-comment-body-unchecked");
-  denies(bash(`echo hi | multica issue comment add 1 --content-stdin`), "multica-comment-body-unchecked");
-  denies(bash(`multica issue comment add 1`), "multica-comment-body-unchecked");
-  denies(bash(`bash -c 'multica agent delete a1'`));
-});
-test("the guard allows Multica reads, issue work and [gremio] comments", () => {
-  for (const c of [
-    "multica agent list", "multica project get p1 --output json", "multica workspace list", "multica --profile x issue list",
-    "multica issue create --title t --project p1 --status todo", "multica issue status 1 in_progress", "multica issue update 1 --description d",
-    "multica issue get 1 --output json", "multica issue comment list 1 --output json --since 2026-01-01T00:00:00Z",
-    `multica issue comment add 1 --content "[gremio] done with the review"`,
-    `multica issue comment add 1 --content="[gremio] kerja udah masuk PR"`,
+    "multica skill create --name x", "multica autopilot create x", "multica runtime update r1", "multica squad create x", "multica workspace create x",
+    "multica agent delete a1", "multica agent skills set a1 --skill-ids s1", "multica project delete p1", "multica workflow update f1",
+    "multica --profile dev agent delete a1", "multica --workspace-id w1 project delete p1", "multica issue delete 1", "multica issue comment delete c1",
+    "multica runtime list", "multica agent create --name x --instructions y --runtime-id rt-gremio", "multica workspace switch w1", "multica agent --help",
+    `multica issue comment add 1 --content "hello"`, `multica issue comment update c1 --content "plain"`,
+    "multica issue comment add 1 --content-file body.md", "echo hi | multica issue comment add 1 --content-stdin", "multica issue comment add 1",
+    `multica issue comment add 123 --content "done k7q-4821"`, `multica issue comment add 123 --content "deny zzz-1234"`,
+    `bash -c 'multica agent delete a1'`, "multica issue create --title t --project p1 --status todo", "multica issue comment list 1 --output json",
   ]) passes(bash(c));
 });
-
-test("the guard denies Multica deletes, workspace writes, skill binding and anything off the allowed list", () => {
-  for (const c of [
-    "multica agent delete a1", "multica agent archive a1", "multica agent restore a1", "multica agent copy a1", "multica agent env set a1 K=V",
-    "multica agent skills set a1 --skill-ids s1", "multica agent skills add a1 --skill-ids s1", "multica agent skills",
-    "multica project delete p1", "multica project resource add p1", "multica workspace update w1 --name x", "multica workspace member add w1 x",
-    "multica workspace invite x", "multica workspace delete w1", "multica workspace create x", "multica workspace mcp add x",
-    "multica workflow update f1", "multica workflow delete f1", "multica workflow archive f1", "multica workflow remove f1",
-    "multica skill delete s1", "multica skill create --name x", "multica autopilot create x", "multica runtime update r1", "multica squad create x",
-    "multica agent --output json delete a1", "multica project --yes delete p1", "multica --profile dev agent skills set a1 --skill-ids s1",
-    "multica --workspace-id w1 agent delete a1", `bash -c 'multica project delete p1'`,
-  ]) denies(bash(c), "multica-structure-write");
-});
-test("the guard allows the Multica project, agent, workflow and workspace-switch writes Gremio owns (own member account, 2026-11-12)", () => {
-  for (const c of [
-    "multica project create --title Co-operative", "multica project update p1 --title x", "multica project update p1 --status in_progress",
-    "multica agent create --name x --instructions y", "multica agent update a1 --instructions y", "multica agent skills list a1",
-    "multica workflow create --steps-file f.json", "multica workflow get f1", "multica workflow list",
-    "multica workspace switch w1", "multica workspace list", "multica workspace get w1", "multica --profile x workspace switch w1",
-    "multica --workspace-id w1 project create --title t", "multica agent --help", "multica project -h", "multica project",
-  ]) passes(bash(c));
+test("a multica command still goes through the other rules when it hides one", () => {
+  denies(bash("multica issue list; kubectl get pods"), "no-cluster-tools");
+  denies(bash(`bash -c 'multica agent list && kubectl get pods'`), "no-cluster-tools");
 });
 
 // ---- rm -rf ----

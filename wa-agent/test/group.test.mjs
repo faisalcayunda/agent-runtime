@@ -7,10 +7,10 @@ import { join } from "node:path";
 import { createCore } from "../src/bridge.mjs";
 import { openState } from "../src/state.mjs";
 import { groupLaneId, isGroupLane } from "../src/ids.mjs";
-import { sandbox } from "../testlib/helpers.mjs";
+import { sandbox, REF_KEY, keyed } from "../testlib/helpers.mjs";
 import { addRef } from "../src/wa-actions.mjs";
 // The ref the bridge gives a message of a lane (4 hex characters of a hash, stable for the same lane and id).
-const rf = (lane, id) => addRef({ refs: {} }, lane, { id }).ref;
+const rf = (lane, id) => addRef({ refs: {}, refKey: REF_KEY }, lane, { id }).ref;
 
 const FAM = "120363@g.us", OTHER = "120999@g.us";
 const LF = "grp_120363", LO = "grp_120999";
@@ -31,7 +31,7 @@ function fakeWa() {
 }
 function mk(S, { groups = new Set([FAM]) } = {}) {
   const wa = fakeWa(), sent = [], clock = { t: 1_800_000_000_000 };
-  const state = openState(join(S.dir, "bridge", "state.json"));
+  const state = keyed(openState(join(S.dir, "bridge", "state.json")));
   const core = createCore({ state, xchg: S.xchg, wa, groups, toRunner: (m) => sent.push(m), now: () => clock.t });
   return { core, wa, sent, state, clock, turns: () => sent.filter((m) => m.op === "turn"), ops: (op) => sent.filter((m) => m.op === op) };
 }

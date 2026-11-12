@@ -169,11 +169,11 @@ test("poll vote answers the question; a vote on a stale poll is ignored", async 
   await up(b);
   await b.core.onRunnerEvent(DEFERRED("toolu_a", "chat"));
   const pollId = b.wa.polls[0].id;
-  await b.core.onVote({ pollId: "poll-unknown", options: ["React"] });
+  await b.core.onVote({ pollId: "poll-unknown", options: ["React"], chat: null, owner: true });
   assert.ok(!existsSync(join(S.xchg, "answers", "toolu_a.json")));
-  await b.core.onVote({ pollId, options: ["React"] });
+  await b.core.onVote({ pollId, options: ["React"], chat: null, owner: true });
   assert.deepEqual(JSON.parse(readFileSync(join(S.xchg, "answers", "toolu_a.json"), "utf8")).answers, { "Which framework?": "React" });
-  await b.core.onVote({ pollId, options: ["Vue"] }); // already answered: not the head any more
+  await b.core.onVote({ pollId, options: ["Vue"], chat: null, owner: true }); // already answered: not the head any more
   assert.equal(b.turns().length, 1);
 });
 
@@ -182,7 +182,7 @@ test("a vote that cannot be decrypted keeps the question at the head and asks fo
   const b = mk(S);
   await up(b);
   await b.core.onRunnerEvent(DEFERRED("toolu_a", "chat"));
-  await b.core.onVote({ pollId: b.wa.polls[0].id, options: null });
+  await b.core.onVote({ pollId: b.wa.polls[0].id, options: null, chat: null, owner: true });
   assert.equal(b.wa.texts.at(-1).text, "poll-nya gak kebaca, jawab pakai angka aja ya");
   assert.equal(b.state.d.queue.length, 1);
   await b.core.onMessage(msg("m9", "1", T0 + 3));
@@ -255,7 +255,7 @@ test("restart between poll send and vote: the vote decrypts from the persisted c
   // and the decoded vote answers the question on the restarted core
   const b2 = mk(S);
   await up(b2);
-  await b2.core.onVote({ pollId, options: votes });
+  await b2.core.onVote({ pollId, options: votes, chat: null, owner: true });
   assert.deepEqual(JSON.parse(readFileSync(join(S.xchg, "answers", "toolu_a.json"), "utf8")).answers, { "Which framework?": "React" });
 });
 

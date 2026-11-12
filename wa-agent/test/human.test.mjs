@@ -9,13 +9,13 @@ import { createCore } from "../src/bridge.mjs";
 import { openState } from "../src/state.mjs";
 import { addRef, extraLines, pollResultLine, readCapped } from "../src/wa-actions.mjs";
 import { messageId } from "../src/wa.mjs";
-import { sandbox } from "../testlib/helpers.mjs";
+import { sandbox, REF_KEY, keyed } from "../testlib/helpers.mjs";
 
 const FAM = "120363@g.us", OTHER = "120999@g.us";
 const LF = "grp_120363", LO = "grp_120999";
 const T0 = 1_800_000_000;
 const MEMBER = "628222@s.whatsapp.net", MEMBER2 = "628333@s.whatsapp.net", OWNER = "628111@s.whatsapp.net";
-const rf = (lane, id) => addRef({ refs: {} }, lane, { id }).ref;
+const rf = (lane, id) => addRef({ refs: {}, refKey: REF_KEY }, lane, { id }).ref;
 const WEBP = Buffer.concat([Buffer.from("RIFF"), Buffer.from([0, 0, 0, 0]), Buffer.from("WEBPVP8 ")]);
 
 function fakeWa() {
@@ -31,7 +31,7 @@ function fakeWa() {
 }
 function mk(S, { groups = new Set([FAM]), path = join(S.dir, "bridge", "state.json"), clock = { t: 1_800_000_000_000 } } = {}) {
   const wa = fakeWa(), sent = [];
-  const state = openState(path);
+  const state = keyed(openState(path));
   const core = createCore({ state, xchg: S.xchg, wa, groups, toRunner: (m) => sent.push(m), now: () => clock.t, reactMs: 0, setTimer: () => ({}), clearTimer: () => {} });
   return { core, wa, sent, state, clock, path, turns: () => sent.filter((m) => m.op === "turn"), results: () => sent.filter((m) => m.op === "wa-result") };
 }
@@ -198,7 +198,7 @@ test("edit and delete work on messages Gremio sent only; a member's message, eve
 });
 
 // ---------- rate limit ----------
-test("rate limit: 6 actions per lane per minute, 30 per hour; the next one gets an error the model can read; lanes count separately", async () => {
+test("rate limit: 6 actions per chat per minute, 30 per hour; the next one gets an error the model can read; a group is a chat of its own", async () => {
   const S = sandbox();
   const b = mk(S);
   await up(b);
@@ -314,7 +314,7 @@ test("wa_poll: 2 to 12 distinct options; the poll is kept so votes can be read, 
   // a question is at the head; a vote on the model's poll does not answer it
   await b.core.onRunnerEvent({ ev: "ask", rid: "ask-" + "a".repeat(16), lane: "chat", text: "Lanjut?" });
   assert.equal(b.state.d.queue.length, 1);
-  await b.core.onVote({ pollId: id, options: ["warteg"], voter: "owner", owner: true });
+  await b.core.onVote({ pollId: id, options: ["warteg"], voter: "owner", owner: true, chat: null });
   assert.equal(b.state.d.queue.length, 1);                            // still waiting for the real answer
 });
 
@@ -328,9 +328,9 @@ test("votes: the owner's vote on a poll Gremio made starts a turn with the tally
   const id = b.wa.calls.find((c) => c.m === "sendPoll").o.id;
   const ref = refOf(r);
   const turns = b.turns().length;
-  await b.core.onVote({ pollId: id, options: ["nasi"], voter: MEMBER, owner: false });
-  await b.core.onVote({ pollId: id, options: ["mie"], voter: MEMBER2, owner: false });
-  await b.core.onVote({ pollId: id, options: ["nasi"], voter: MEMBER, owner: false });   // the same voter again: still one vote
+  await b.core.onVote({ pollId: id, options: ["nasi"], voter: MEMBER, owner: false, chat: FAM });
+  await b.core.onVote({ pollId: id, options: ["mie"], voter: MEMBER2, owner: false, chat: FAM });
+  await b.core.onVote({ pollId: id, options: ["nasi"], voter: MEMBER, owner: false, chat: FAM });   // the same voter again: still one vote
   assert.equal(b.turns().length, turns);                                                  // members' votes start no turn
   await b.core.onMessage(gmsg("g2", "gremio hasilnya?", { ts: T0 + 5 }));
   assert.equal(b.turns().at(-1).prompt, `[hasil polling #${ref}: nasi=1, mie=1]\n\n[Budi #${rf(LF, "g2")}] gremio hasilnya?`);
@@ -339,7 +339,7 @@ test("votes: the owner's vote on a poll Gremio made starts a turn with the tally
   assert.equal(b.turns().at(-1).prompt, `[Budi #${rf(LF, "g3")}] gremio lagi`);        // delivered once
   await b.core.onRunnerEvent(result(LF));
   // the owner's vote is an answer: a turn of its own with the tally so far
-  await b.core.onVote({ pollId: id, options: ["mie"], voter: "owner", owner: true });
+  await b.core.onVote({ pollId: id, options: ["mie"], voter: "owner", owner: true, chat: FAM });
   assert.equal(b.turns().length, turns + 3);
   assert.equal(b.turns().at(-1).lane, LF);
   assert.equal(b.turns().at(-1).prompt, `[hasil polling #${ref}: nasi=1, mie=2]`);
@@ -347,18 +347,18 @@ test("votes: the owner's vote on a poll Gremio made starts a turn with the tally
   // the owner's identical vote again (an upsert and an update can both deliver it) is no second turn
   await b.core.onRunnerEvent(result(LF));
   const turnsNow = b.turns().length;
-  await b.core.onVote({ pollId: id, options: ["mie"], voter: "owner", owner: true });
+  await b.core.onVote({ pollId: id, options: ["mie"], voter: "owner", owner: true, chat: FAM });
   assert.equal(b.turns().length, turnsNow);
-  await b.core.onVote({ pollId: id, options: ["nasi", "mie"], voter: "owner", owner: true });       // a changed vote is news
+  await b.core.onVote({ pollId: id, options: ["nasi", "mie"], voter: "owner", owner: true, chat: FAM });       // a changed vote is news
   assert.equal(b.turns().length, turnsNow + 1);
   assert.equal(b.turns().at(-1).prompt, `[hasil polling #${ref}: nasi=2, mie=2]`);
   await b.core.onRunnerEvent(result(LF));
-  await b.core.onVote({ pollId: id, options: ["mie", "nasi"], voter: "owner", owner: true });       // the same set in another order is the same vote
+  await b.core.onVote({ pollId: id, options: ["mie", "nasi"], voter: "owner", owner: true, chat: FAM });       // the same set in another order is the same vote
   assert.equal(b.turns().length, turnsNow + 1);
   // unreadable votes and votes on unknown polls change nothing
-  await b.core.onVote({ pollId: id, options: null, voter: MEMBER, owner: false });
-  await b.core.onVote({ pollId: "unknown", options: ["a"], voter: MEMBER, owner: false });
-  await b.core.onVote({ pollId: id, options: ["nasi"], voter: "__proto__", owner: false });
+  await b.core.onVote({ pollId: id, options: null, voter: MEMBER, owner: false, chat: FAM });
+  await b.core.onVote({ pollId: "unknown", options: ["a"], voter: MEMBER, owner: false, chat: FAM });
+  await b.core.onVote({ pollId: id, options: ["nasi"], voter: "__proto__", owner: false, chat: FAM });
   assert.deepEqual(Object.keys(b.state.d.xpolls[id].votes).sort(), ["owner", MEMBER, MEMBER2].sort());
 });
 
@@ -375,15 +375,15 @@ test("a poll someone else creates is rendered; its votes are aggregated after a 
   const px = rf(LF, "P1");
   assert.deepEqual(b.state.d.xpolls.P1.options.length, 3);
   assert.equal(b.state.d.xpolls.P1.raw, raw);                                               // the creation message is kept for decrypting votes
-  await b.core.onVote({ pollId: "P1", options: ["ikut"], voter: MEMBER, owner: false });
-  await b.core.onVote({ pollId: "P1", options: ["ikut"], voter: MEMBER2, owner: false });
-  await b.core.onVote({ pollId: "P1", options: ["gak"], voter: "628444@s.whatsapp.net", owner: false });
+  await b.core.onVote({ pollId: "P1", options: ["ikut"], voter: MEMBER, owner: false, chat: FAM });
+  await b.core.onVote({ pollId: "P1", options: ["ikut"], voter: MEMBER2, owner: false, chat: FAM });
+  await b.core.onVote({ pollId: "P1", options: ["gak"], voter: "628444@s.whatsapp.net", owner: false, chat: FAM });
   assert.equal(b.turns().length, 1);
   // restart: a new core on the same state file
   const b2 = mk(S, { path: b.path });
   await up(b2);
   assert.equal(b2.state.d.xpolls.P1.raw, raw);
-  await b2.core.onVote({ pollId: "P1", options: ["gak"], voter: MEMBER2, owner: false });   // changes her mind after the restart
+  await b2.core.onVote({ pollId: "P1", options: ["gak"], voter: MEMBER2, owner: false, chat: FAM });   // changes her mind after the restart
   await b2.core.onMessage(gmsg("g1", "gremio ringkas", { ts: T0 + 9 }));
   const p = b2.turns().at(-1).prompt;
   const lines = p.split("\n");

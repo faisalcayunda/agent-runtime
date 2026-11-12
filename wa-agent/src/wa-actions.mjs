@@ -2,8 +2,9 @@
 // model reads for what other people send (polls, locations, contacts, mentions). Pure helpers: no socket, no clock of its own.
 // Everything that comes from WhatsApp is attacker-controlled text here, so every string that reaches a prompt goes through
 // clean() or cleanName() first: no brackets (the "[name (owner)]" marker must stay unforgeable), no line breaks, capped.
-import { createHash } from "node:crypto";
-import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
+import { createHmac, randomBytes } from "node:crypto";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const MB = 1024 * 1024;
 export const SEND_CAPS = { image: 5 * MB, sticker: 5 * MB, video: 16 * MB, document: 20 * MB };
@@ -31,12 +32,14 @@ export const findRef = (S, lane, ref) => { const r = parseRef(ref); return r ? (
 export const findMsg = (S, lane, id) => S.refs[lane]?.items.find((i) => i.id === id) ?? null;
 
 // Adds a message (or returns the one already there: a record is never rewritten, so a quote cannot turn a member's message
-// into one of Gremio's). The ref is 4 hex characters of a hash, one longer for each clash within the lane.
+// into one of Gremio's). The ref is 4 hex characters of an HMAC, one longer for each clash within the lane. The key is random,
+// made once per bridge and kept in its state: a ref cannot be worked out from a message id (which a lane may know) alone.
 export function addRef(S, lane, entry) {
   const t = refTable(S, lane);
   const hit = t.items.find((i) => i.id === entry.id);
   if (hit) return hit;
-  const h = createHash("sha1").update(`${lane}:${entry.id}`).digest("hex");
+  S.refKey ??= randomBytes(32).toString("hex");
+  const h = createHmac("sha256", S.refKey).update(`${lane}:${entry.id}`).digest("hex");
   let len = 4;
   while (len < 12 && t.items.some((i) => i.ref === h.slice(0, len))) len++;
   const item = { ...entry, ref: h.slice(0, len) };
@@ -59,18 +62,26 @@ export function addPerson(S, lane, jids, name) {
 }
 export const personName = (S, lane, jid) => S.refs[lane]?.people[jid]?.n;
 
-// ---------- rate limit: at most 6 actions per lane per minute and 30 per hour, counted when the action is accepted ----------
-export function rateLimiter(now) {
-  const hits = new Map();
+// ---------- rate limit: at most 6 actions per destination chat per minute and 30 per hour ----------
+// `table` is a map in bridge state (chat -> [ms of each accepted action]), so a restart does not reset it. check() only looks; take()
+// counts an action, and the caller takes only after it has validated the action: a refused action costs no slot.
+export function rateLimiter(now, table) {
+  const look = (chat) => {
+    const t = now();
+    const a = (Array.isArray(table[chat]) ? table[chat] : []).filter((x) => Number.isFinite(x) && t - x < 3600_000);
+    if (a.length) table[chat] = a; else delete table[chat];
+    const m = a.filter((x) => t - x < 60_000);
+    if (m.length >= RATE_PER_MIN) return { ok: false, waitS: Math.ceil((60_000 - (t - m[0])) / 1000) };
+    if (a.length >= RATE_PER_HOUR) return { ok: false, waitS: Math.ceil((3600_000 - (t - a[0])) / 1000) };
+    return { ok: true, a, t };
+  };
   return {
-    take(lane) {
-      const t = now();
-      const a = (hits.get(lane) ?? []).filter((x) => t - x < 3600_000);
-      const m = a.filter((x) => t - x < 60_000);
-      hits.set(lane, a);
-      if (m.length >= RATE_PER_MIN) return { ok: false, waitS: Math.ceil((60_000 - (t - m[0])) / 1000) };
-      if (a.length >= RATE_PER_HOUR) return { ok: false, waitS: Math.ceil((3600_000 - (t - a[0])) / 1000) };
-      a.push(t);
+    check(chat) { const { ok, waitS } = look(chat); return ok ? { ok } : { ok, waitS }; },
+    take(chat) {
+      const v = look(chat);
+      if (!v.ok) return v;
+      v.a.push(v.t);
+      table[chat] = v.a;
       return { ok: true };
     },
   };
@@ -124,11 +135,13 @@ export function extraLines(n, { ref, full, nameOf }) {
 
 // ---------- reading a file to send ----------
 // Opens without following a final symlink and counts the bytes it actually reads: neither stat nor a claimed size is trusted.
-export function readCapped(path, cap) {
+// uid: when given, the file must also belong to that uid and have no other hard link (a link to a file of another uid is not staged by it).
+export function readCapped(path, cap, { uid } = {}) {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) throw new Error("not a regular file");
+    if (uid != null && (st.uid !== uid || st.nlink !== 1)) throw new Error("not a file the runner staged");
     if (st.size > cap) throw new Error(`file is over ${cap / 1024 / 1024} MB`);
     const chunks = [], b = Buffer.alloc(65536);
     let total = 0;
@@ -141,6 +154,13 @@ export function readCapped(path, cap) {
     }
     return Buffer.concat(chunks);
   } finally { closeSync(fd); }
+}
+// A file staged by the runner in `dir` (its outbox: /xchg/sock/outbox). O_NOFOLLOW guards only the last path component, so the
+// directory itself is checked too: a real directory (not a link) owned by the uid that owns its parent, and the file by that uid.
+export function readStaged(dir, name, cap) {
+  const parent = lstatSync(dirname(dir)), d = lstatSync(dir);
+  if (!parent.isDirectory() || !d.isDirectory() || d.uid !== parent.uid) throw new Error("the staging directory is not the runner's");
+  return readCapped(join(dir, name), cap, { uid: parent.uid });
 }
 const MIME = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", mp4: "video/mp4", mov: "video/quicktime", mkv: "video/x-matroska", pdf: "application/pdf", txt: "text/plain", csv: "text/csv", json: "application/json", zip: "application/zip", xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", md: "text/markdown" };
 export const mimeOf = (kind, name) => (kind === "sticker" ? "image/webp" : MIME[String(name ?? "").split(".").pop().toLowerCase()] ?? (kind === "image" ? "image/jpeg" : kind === "video" ? "video/mp4" : "application/octet-stream"));

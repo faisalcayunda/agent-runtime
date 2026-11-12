@@ -10,6 +10,7 @@
 // session id; every write goes through safeWrite. The actions of a normal user (react, reply, media, poll, mention, edit, delete,
 // PLAN 2.14) come from the runner as `wa-action`; the bridge picks the destination from the lane that asked and validates the rest.
 import net from "node:net";
+import { randomBytes } from "node:crypto";
 import { readdirSync, statSync, unlinkSync } from "node:fs";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -19,13 +20,16 @@ import { parseCommand } from "./commands.mjs";
 import { questionsOf } from "./stream.mjs";
 import { attach, send } from "./ipc.mjs";
 import { MEDIA_CAPS, maskJid, messageId } from "./wa.mjs";
-import { NOTES_MAX, PERSON_JID, SEND_CAPS, addPerson, addRef, cleanName, extraLines, findMsg, findRef, isEmojiOrEmpty, isWebp, mimeOf, personName, pollLine, pollResultLine, rateLimiter, readCapped, refTable } from "./wa-actions.mjs";
+import { NOTES_MAX, PERSON_JID, SEND_CAPS, addPerson, addRef, cleanName, extraLines, findMsg, findRef, isEmojiOrEmpty, isWebp, mimeOf, personName, pollLine, pollResultLine, rateLimiter, readCapped, readStaged, refTable } from "./wa-actions.mjs";
 import { createHealth, httpGet } from "./health.mjs";
 import { groupLaneId, inside, isGroupLane, validFile, validId } from "./ids.mjs";
 import { ACK_TRIGGER_MAX, REACT_TRIGGER_MAX, cleanAck, cleanEmoji } from "./ack.mjs";
 
 const MAX_TEXT = 4000; // WhatsApp message length we split at (UNVERIFIED limit, PLAN 2.2 step 4)
 const POLL_MAX_OPTIONS = 12;
+const POLL_RAW_MAX = 16 * 1024;     // the creation message of a poll someone else made, kept to decrypt its votes (a real one is about 1 KB)
+const OWN_POLL_RAW_MAX = 32 * 1024; // the same for a poll Gremio made (its question and options are checked before it is sent)
+const POLL_OPTION_MAX = 100;        // WhatsApp's limit; a longer label is not a poll this bridge keeps, because a vote names the label in full
 const EDIT_WINDOW_MS = 15 * 60 * 1000; // WhatsApp lets a message be edited for 15 minutes
 const ACTION_MS = 60000;                // the longest the bridge works on one action before it tells the model it did not confirm
 const CODE_TTL_MS = 24 * 3600 * 1000;
@@ -101,6 +105,13 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   const today = () => new Date(now()).toISOString().slice(0, 10);
   const newLane = () => ({ queue: [], inflight: null });
   S.lanes.chat ??= newLane();
+  // The first start with HMAC refs (no key yet): records written before this fix cannot say whether the model or the bridge wrote them, so
+  // every own message but a turn's `t:` text becomes "system" and stays out of edit and delete.
+  if (!S.refKey) {
+    const turnText = new Set(Object.keys(S.outbox).filter((k) => k.startsWith("t:")).flatMap((k) => Array.from({ length: 8 }, (_, i) => messageId(k, i))));
+    for (const t of Object.values(S.refs)) for (const it of t.items ?? []) if (it.mine && it.kind === "text" && !turnText.has(it.id)) it.kind = "system";
+    S.refKey = randomBytes(32).toString("hex");
+  }
 
   // One runner event, vote or message at a time: handlers await WhatsApp sends, and two interleaved handlers would each
   // see the same unshown question and send it twice.
@@ -109,13 +120,18 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
 
   // ---- outbound: dedup ledger, chunking, retry list ----
   // to: null = the owner; {jid, quote} = a group (the first chunk quotes the message that triggered the reply).
+  // Every message Gremio sends is a record its lane can react to or quote. Only what the model wrote (the `t:` text of a turn, and its
+  // `act:` sends) is kind "text", which edit and delete accept; everything the bridge wrote itself (a question, a notification, an error,
+  // a command reply, an ack) is kind "system": the model must not be able to change what the owner reads and answers. The kind comes
+  // from the key, so a send replayed from the retry list keeps it.
   async function sendOnce(key, text, to = null, retry = true) {
     if (S.outbox[key] || !text.trim()) return;
     const parts = splitText(text);
-    const rl = to ? groupLaneId(to.jid) : "chat"; // every message Gremio sends is a record its lane (and nobody else) can react to, edit or delete
+    const rl = to ? groupLaneId(to.jid) : "chat";
+    const kind = key.startsWith("t:") ? "text" : "system";
     try {
       for (let i = 0; i < parts.length; i++) {
-        if (rl) recordSent(rl, messageId(key, i), parts[i], to?.jid ?? null);
+        if (rl) recordSent(rl, messageId(key, i), parts[i], to?.jid ?? null, kind);
         if (to) await wa.sendGroup(to.jid, parts[i], { id: messageId(key, i), ...(i === 0 && to.quote ? { quote: to.quote } : {}) });
         else await wa.sendText(parts[i], { id: messageId(key, i) });
       }
@@ -156,6 +172,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   const nameIn = (lane) => (jid) => personName(S, lane, jid) ?? maskJid(jid);
   const keepPoll = (lane, n, ref) => {
     if (!n.poll || !n.pollRaw || !n.id || S.xpolls[n.id]) return;
+    if (String(n.pollRaw).length > POLL_RAW_MAX || n.poll.options.some((o) => String(o).length > POLL_OPTION_MAX)) return log("a poll that is too big is not kept: its votes will not be tallied");
     S.xpolls[n.id] = { raw: n.pollRaw, lane, ref, question: n.poll.question.slice(0, 250), options: n.poll.options.slice(0, POLL_MAX_OPTIONS), own: false, multi: n.poll.multi, votes: {}, ts: now() };
   };
   // Seen since the lane's last turn: kept (bounded) and shown with the next turn that a message starts; a note never starts one.
@@ -270,15 +287,25 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   const react = (key, group, emoji) => { if (key) Promise.resolve(wa.react?.(key, { ...(group ? { jid: group } : {}), ...(emoji ? { emoji } : {}) })).catch((e) => log(`reaction failed: ${e.message}`)); };
 
   // ---- questions ----
+  // The ids of the messages a question was sent as (it can be split): kept on the entry, and on the grant it leads to, so that nothing
+  // an approval depends on can be edited or deleted afterwards, whatever its record says.
+  const idsOf = (key, text) => splitText(text).map((_, i) => messageId(key, i));
+  function pinned() {
+    const ids = new Set(Object.keys(S.polls));
+    for (const e of [...S.queue, ...Object.values(S.gq).flat(), ...Object.values(S.grants)]) for (const id of e?.msgs ?? []) ids.add(id);
+    return ids;
+  }
   async function showHead() {
     const head = S.queue[0];
     if (!head || head.shown) return;
-    if (head.kind === "ask-owner") { await sendOnce(`q:${head.id}`, head.text); } else {
-      const q = head.questions[head.cursor];
-      await sendOnce(`q:${head.id}:${head.cursor}`, renderQuestion(head));
+    if (head.kind === "ask-owner") { head.msgs = idsOf(`q:${head.id}`, head.text); await sendOnce(`q:${head.id}`, head.text); } else {
+      const q = head.questions[head.cursor], text = renderQuestion(head);
+      head.msgs = [...(head.msgs ?? []), ...idsOf(`q:${head.id}:${head.cursor}`, text)];
+      await sendOnce(`q:${head.id}:${head.cursor}`, text);
       if (q.options.length >= 2 && q.options.length <= POLL_MAX_OPTIONS) {
         try {
           const p = await wa.sendPoll(q.question.slice(0, 250), q.options, { id: messageId(`poll:${head.id}:${head.cursor}`), multi: q.multiSelect });
+          head.msgs.push(p.id);
           S.polls[p.id] = { raw: p.raw, qid: head.id, cursor: head.cursor, ts: now() };
         } catch (e) { log(`poll failed, the numbered text still carries the question: ${e.message}`); }
       }
@@ -311,7 +338,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       const url = PR_URL.exec(qq.question)?.[0];
       if (url && isMergeYes(head.answers[qq.question] ?? "")) {
         const g = writeGrant(xchg, "merge", { url, tool_use_id: head.id }, now());
-        S.grants[g.id] = { kind: "merge", ts: g.created_at };
+        S.grants[g.id] = { kind: "merge", ts: g.created_at, msgs: head.msgs ?? [] };
       }
     }
     safeWrite(inside(answersDir, `${head.id}.json`), JSON.stringify({ questions: head.input?.questions ?? [], answers: head.answers }), 0o644);
@@ -331,7 +358,9 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   async function showGroupHead(id) {
     const head = S.gq[id]?.[0], to = laneDest(id);
     if (!head || head.shown || !to) return;
-    await sendOnce(`q:${head.id}:${head.cursor}`, renderQuestion(head, { group: true }), to);
+    const text = renderQuestion(head, { group: true });
+    head.msgs = [...(head.msgs ?? []), ...idsOf(`q:${head.id}:${head.cursor}`, text)];
+    await sendOnce(`q:${head.id}:${head.cursor}`, text, to);
     head.shown = true;
     save();
   }
@@ -439,10 +468,13 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   // A vote on a poll that is not a question of the owner's queue: Gremio's own poll (wa_poll) or someone else's. The latest vote of each
   // voter counts, so the same vote arriving twice changes nothing. It is tallied, shown on the lane's next turn, and starts one only when
   // the owner votes on a poll Gremio made (he answered it).
-  function voteOnPoll(pollId, options, voter, owner) {
+  // chat is where the vote was cast: null for the owner's DM, the group's JID otherwise. It has to be the poll's own chat, or a vote
+  // from anywhere else (another group, a stranger's DM) that names this poll's id would count.
+  function voteOnPoll(pollId, options, voter, owner, chat) {
     const x = S.xpolls[pollId];
     if (!x || options === null) return log("vote for a poll that is not kept, or not readable");
     if (!S.lanes[x.lane] || (isGroupLane(x.lane) && !laneDest(x.lane))) return;
+    if (!(isGroupLane(x.lane) ? chat === S.groups[x.lane].jid : chat === null && owner === true)) return log("vote from another chat than the poll's");
     if (voter !== "owner" && !PERSON_JID.test(String(voter))) return;
     const same = (a, b) => [...a].sort().join("\u0000") === [...b].sort().join("\u0000");
     if (same(x.votes[voter] ?? [], options)) return; // the same vote again (it can arrive as an upsert and as an update): nothing changes, nothing is told
@@ -453,8 +485,9 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     }
     addNote(x.lane, { k: "poll-result", id: pollId }, `r:${pollId}`);
   }
-  async function onVote({ pollId, options, voter, owner }) {
-    if (!S.polls[pollId]) return voteOnPoll(pollId, options, voter, owner);
+  async function onVote({ pollId, options, voter, owner, chat }) {
+    if (!S.polls[pollId]) return voteOnPoll(pollId, options, voter, owner, chat);
+    if (chat !== null || owner !== true) return log("vote on a question from outside the owner's chat"); // a question is the owner's, in his DM
     const p = S.polls[pollId], head = S.queue[0];
     if (!p || !head || head.id !== p.qid || head.cursor !== p.cursor) return log("vote for a poll that is not the head question");
     if (options === null) return sendOnce(`unreadable:${pollId}:${now()}`, POLL_UNREADABLE); // keeps the question at the head
@@ -536,8 +569,8 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   // ---- the actions of a normal user (PLAN 2.14) ----
   // The runner forwards a model's tool call as {ev: "wa-action", rid, lane, action, args}; the lane comes from the token the runner
   // checked. The model never names a destination: it is the lane's own (the owner for chat and task lanes, that group for a group lane),
-  // and a message is named by a ref of this lane's table. At most 6 actions per lane per minute and 30 per hour, counted on acceptance.
-  const limiter = rateLimiter(now);
+  // and a message is named by a ref of this lane's table. At most 6 actions per destination chat per minute and 30 per hour (the owner's lanes share one chat), counted when an action has been accepted.
+  const limiter = rateLimiter(now, S.rate);
   const OUTBOX = join(xchg, "sock", "outbox"), INBOX = join(xchg, "inbox");
   const fail = (msg) => { throw new Error(msg); };
   const keyOf = (it) => (it.mine ? { id: it.id, fromMe: true, ...(it.chat ? { remoteJid: it.chat } : {}) } : { id: it.id, remoteJid: it.chat, ...(it.from ? { participant: it.from } : {}), fromMe: false });
@@ -556,11 +589,11 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   function loadFile(lane, kind, args) {
     const cap = SEND_CAPS[kind];
     if (!cap) fail("kind must be image, sticker, document or video");
-    let path, base;
+    let path, base, staged = null;
     if (args.file != null) {
       const f = String(args.file), parts = f.split(".");
       if (!(parts.length === 3 && parts[0] === lane && /^[0-9a-f]{16}$/.test(parts[1]) && /^[a-z0-9]{1,8}$/.test(parts[2]))) fail("bad staged file name");
-      path = join(OUTBOX, f); base = String(args.fileName ?? f);
+      path = join(OUTBOX, f); staged = f; base = String(args.fileName ?? f);
     } else if (args.inbox != null) {
       const f = String(args.inbox);
       if (!/^[\w-]{1,100}(?:\.[A-Za-z0-9]{1,8})?$/.test(f)) fail("bad inbox file name");
@@ -569,7 +602,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       path = join(INBOX, f); base = f;
     } else fail("no file given");
     let data;
-    try { data = readCapped(path, cap); } catch (e) { fail(`cannot send that file: ${e.code === "ENOENT" ? "it is not there" : e.message}`); }
+    try { data = staged ? readStaged(OUTBOX, staged, cap) : readCapped(path, cap); } catch (e) { fail(`cannot send that file: ${e.code === "ENOENT" ? "it is not there" : e.message}`); }
     if (kind === "sticker" && !isWebp(data)) fail("a sticker must be a webp image");
     return { data, name: basename(base).replace(/[^\w.\- ]/g, "_").slice(0, 100) || "file" };
   }
@@ -596,8 +629,10 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     const group = isGroupLane(lane), to = group ? laneDest(lane) : null;
     if (group && !to) fail("this group is not allowed any more");
     if (wa.isOpen?.() === false) fail("WhatsApp is not connected right now");
-    const lim = limiter.take(lane);
-    if (!lim.ok) fail(`rate limit: at most 6 actions per minute and 30 per hour in a chat; try again in ${lim.waitS} s`);
+    const dest = to?.jid ?? "owner";
+    const limited = (l) => l.ok || fail(`rate limit: at most 6 actions per minute and 30 per hour in a chat; try again in ${l.waitS} s`);
+    limited(limiter.check(dest)); // refused early, before a file is read; the slot is taken only by accept(), once the action has been validated
+    const accept = () => { limited(limiter.take(dest)); save(); };
     const o = group ? { jid: to.jid } : {};
     const id = messageId(`act:${m.rid}`);
     const shown = () => { cancelAck(lane); cancelReact(lane); }; // a visible action answers the message: no 👀 or progress line after it
@@ -605,12 +640,15 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     switch (m.action) {
       case "react": {
         if (!isEmojiOrEmpty(args.emoji)) fail("emoji must be exactly one emoji, or an empty string to take the reaction back");
-        await wa.reactAny(keyOf(needRef(lane, args.ref, to)), args.emoji, o);
+        const key = keyOf(needRef(lane, args.ref, to));
+        accept();
+        await wa.reactAny(key, args.emoji, o);
         shown();
         return {};
       }
       case "reply": {
         const text = textArg(args.text), it = needRef(lane, args.ref, to);
+        accept();
         const r = sent(text);
         await wa.reply(text, { key: keyOf(it), message: { conversation: it.text ?? "" } }, { ...o, id });
         shown();
@@ -621,6 +659,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
         const caption = args.caption == null || kind === "sticker" ? "" : String(args.caption).trim();
         if (caption.length > 1000) fail("caption must be at most 1000 characters");
         const { data, name } = loadFile(lane, kind, args);
+        accept();
         const r = sent(caption || `[${kind}]`, "media");
         await wa.sendMedia({ kind, data, mimetype: mimeOf(kind, name), fileName: name, caption }, { ...o, id });
         shown();
@@ -633,9 +672,10 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
         if (options.length < 2 || options.length > POLL_MAX_OPTIONS || options.some((x) => !x || x.length > 100)) fail(`a poll needs 2 to ${POLL_MAX_OPTIONS} options of 1 to 100 characters`);
         if (new Set(options.map((x) => x.toLowerCase())).size !== options.length) fail("the options must all be different");
         const multi = args.multi === true;
+        accept();
         const p = await wa.sendPoll(question, options, { ...o, id, multi });
         const r = sent(question, "poll");
-        S.xpolls[p.id] = { raw: p.raw, lane, ref: r.ref.slice(1), question, options, own: true, multi, votes: {}, ts: now() }; // votes come back as events (voteOnPoll)
+        if (typeof p.raw === "string" && p.raw.length <= OWN_POLL_RAW_MAX) S.xpolls[p.id] = { raw: p.raw, lane, ref: r.ref.slice(1), question, options, own: true, multi, votes: {}, ts: now() }; // votes come back as events (voteOnPoll)
         shown();
         save();
         return r;
@@ -652,6 +692,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
           text = text.replace(new RegExp(escapeRe(token), "gi"), `@${jid.split("@")[0]}`);
           jids.push(jid);
         }
+        accept();
         const r = sent(text);
         await wa.sendMention(text, [...new Set(jids)], { ...o, id });
         shown();
@@ -660,8 +701,10 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       case "edit": {
         const text = textArg(args.text), it = needRef(lane, args.ref, to);
         if (!it.mine) fail("I can only edit messages I sent myself");
+        if (it.kind === "system" || pinned().has(it.id)) fail("that is a message of the bridge (a question, notice or command reply), not one I wrote: it cannot be edited");
         if (it.kind !== "text") fail("only a plain text message can be edited");
         if (now() - (it.ts ?? 0) > EDIT_WINDOW_MS) fail("WhatsApp only allows an edit within 15 minutes of sending");
+        accept();
         await wa.edit(it.id, text, o);
         it.text = text.slice(0, 200);
         save();
@@ -670,6 +713,8 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       case "delete": {
         const it = needRef(lane, args.ref, to);
         if (!it.mine) fail("I can only delete messages I sent myself");
+        if (it.kind === "system" || pinned().has(it.id)) fail("that is a message of the bridge (a question, notice or command reply), not one I wrote: it cannot be deleted");
+        accept();
         await wa.remove(it.id, o);
         const t = refTable(S, lane);
         t.items = t.items.filter((i) => i !== it);

@@ -7,11 +7,11 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { join } from "node:path";
 import { createCore, mediaNotes } from "../src/bridge.mjs";
 import { openState } from "../src/state.mjs";
-import { fakeBin, sandbox, tmp, waitFor } from "../testlib/helpers.mjs";
+import { fakeBin, sandbox, tmp, waitFor, REF_KEY, keyed } from "../testlib/helpers.mjs";
 import { attach } from "../src/ipc.mjs";
 import { addRef } from "../src/wa-actions.mjs";
 // The ref the bridge gives a message of a lane (4 hex characters of a hash, stable for the same lane and id).
-const rf = (lane, id) => addRef({ refs: {} }, lane, { id }).ref;
+const rf = (lane, id) => addRef({ refs: {}, refKey: REF_KEY }, lane, { id }).ref;
 import { connect, startRunner } from "../testlib/harness.mjs";
 
 const FAM = "120363@g.us", OTHER = "120999@g.us", LF = "grp_120363";
@@ -57,7 +57,7 @@ function fakeTimers() {
 // reactMs: 0 = at once; null = the production default (30 s). ackTextMs defaults to production's 8 s.
 function mk(S, { groups = new Set([FAM]), statusMs = 30, reactMs = 0, ...more } = {}) {
   const wa = fakeWa(), sent = [], T = fakeTimers(), clock = { t: 1_800_000_000_000 };
-  const state = openState(join(S.dir, "bridge", "state.json"));
+  const state = keyed(openState(join(S.dir, "bridge", "state.json")));
   const core = createCore({ state, xchg: S.xchg, wa, groups, statusMs, setTimer: T.setTimer, clearTimer: T.clearTimer, ...(reactMs === null ? {} : { reactMs }), ...more, toRunner: (m) => sent.push(m), now: () => (clock.t += 1000) });
   return { core, wa, sent, state, T, clock, turns: () => sent.filter((m) => m.op === "turn") };
 }
@@ -695,7 +695,7 @@ test("ack text end to end: bridge core, real runner, fake router: the generated 
     const R = await startRunner(S, { script: ["hang"], env: { ANTHROPIC_BASE_URL: router.url, ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite" } });
     const conn = await connect(R.sock, { role: "bridge" });
     const b = mk(S);                                                 // its fake timers and WhatsApp; the core below talks to the real runner
-    const core = createCore({ state: openState(join(S.dir, "bridge2", "state.json")), xchg: S.xchg, wa: b.wa, setTimer: b.T.setTimer, clearTimer: b.T.clearTimer, reactMs: 0, toRunner: (m) => conn.send(m), now: () => (b.clock.t += 1000) });
+    const core = createCore({ state: keyed(openState(join(S.dir, "bridge2", "state.json"))), xchg: S.xchg, wa: b.wa, setTimer: b.T.setTimer, clearTimer: b.T.clearTimer, reactMs: 0, toRunner: (m) => conn.send(m), now: () => (b.clock.t += 1000) });
     attach(conn.socket, (ev) => { if (ev.ev === "ack-text") core.onRunnerEvent(ev); });
     await core.onOpen();
     await core.onRunnerEvent({ ev: "hello", busy: [] });
@@ -848,7 +848,7 @@ test("react emoji end to end: bridge core, real runner, fake router: the generat
     const R = await startRunner(S, { script: ["hang"], env: { ANTHROPIC_BASE_URL: router.url, ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite" } });
     const conn = await connect(R.sock, { role: "bridge" });
     const b = mk(S);
-    const core = createCore({ state: openState(join(S.dir, "bridge2", "state.json")), xchg: S.xchg, wa: b.wa, setTimer: b.T.setTimer, clearTimer: b.T.clearTimer, toRunner: (m) => conn.send(m), now: () => (b.clock.t += 1000) });
+    const core = createCore({ state: keyed(openState(join(S.dir, "bridge2", "state.json"))), xchg: S.xchg, wa: b.wa, setTimer: b.T.setTimer, clearTimer: b.T.clearTimer, toRunner: (m) => conn.send(m), now: () => (b.clock.t += 1000) });
     attach(conn.socket, (ev) => { if (ev.ev === "ack-text") core.onRunnerEvent(ev); });
     await core.onOpen();
     await core.onRunnerEvent({ ev: "hello", busy: [] });

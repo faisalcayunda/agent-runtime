@@ -17,4 +17,7 @@ while IFS= read -r p; do add "$mp/$p"; done < <(jq -r '.skills[]' "$mp/.claude-p
 for n in antislop antislop-code antislop-copywriting antislop-human antislop-layoutmobile antislop-ui; do add "$as/skills/$n"; done
 add "$rea"
 add "$ts"
+# local skills shipped with wa-agent (wa-agent/skills/*), found relative to this script: /opt/wa-agent/build/../skills in the image
+local_skills="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/skills"
+if [ -d "$local_skills" ]; then for d in "$local_skills"/*/; do add "${d%/}"; done; fi
 echo "assemble-skills: $(ls "$out" | wc -l | tr -d ' ') skills"

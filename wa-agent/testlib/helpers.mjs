@@ -34,3 +34,7 @@ export async function waitFor(fn, ms = 4000, step = 10) {
     await sleep(step);
   }
 }
+
+// The refs of a test bridge use this key, so a test can work out the ref of a message id (production keys are random per bridge).
+export const REF_KEY = "ab".repeat(32);
+export const keyed = (state) => { state.d.refKey = REF_KEY; return state; };

@@ -10,28 +10,22 @@
 // and there is no WA_XCHG_DIR override: a user-settings `env` key could otherwise point the guard at a
 // forged grants directory. Tests pass `ctx.xchg` instead.
 //
-// Speed bump, not a boundary: the owner tokens can do all of this (PLAN 5.2).
+// Speed bump, not a boundary: the owner tokens can do all of this (PLAN 5.2). Since 2026-11-12 (owner decision: Gremio has full Multica
+// access under its own account) the guard has no multica rule: no deny list, no comment prefix, no approval relay.
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 
+// Format of the code in a critical notify_owner (the owner MCP and its tests use it); no guard rule reads codes any more.
+export const CODE_RE = /^[a-z0-9]{3,8}-[0-9]{3,6}$/i;
 const GRANT_TTL_MS = 24 * 3600 * 1000;
 const PROTECTED_BRANCH = /^(main|master|dev)$/;
 const WRAPPERS = new Set(["sudo", "env", "nohup", "time", "command", "exec", "nice", "timeout", "setsid", "stdbuf", "ionice"]);
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 const INTERPRETERS = /^(python3?|node|perl|ruby|php|awk|gawk)$/;
-// Approval codes: PLAN leaves the format open (2.12). Fixed shape so prose like "done with X" never matches.
-export const CODE_RE = /^[a-z0-9]{3,8}-[0-9]{3,6}$/i;
-const APPROVAL_RE = /\b(done|deny)\s+([a-z0-9]{3,8}-[0-9]{3,6})\b/gi;
 const DB_CLIENT = /\b(psql|mysql|mariadb|sqlite3|trino|clickhouse-client|duckdb|pgcli|usql)\b/i;
 const NO_SQL_SCAN = /^mcp__(owner|context7)__/;
-const STRUCT_NOUNS = new Set(["agent", "workspace", "skill", "project", "workflow", "autopilot", "runtime", "squad"]);
-const READ_VERBS = new Set(["list", "ls", "get", "show", "view", "search", "status", "info"]);
-// Structure writes Gremio may run (owner decision 2026-11-12: it logs in with its own member account, so Multica's
-// permissions bound it). Everything else on these nouns that is not a read verb is denied, delete/archive included.
-const MULTICA_STRUCT_WRITES = { project: new Set(["create", "update"]), agent: new Set(["create", "update"]), workflow: new Set(["create"]), workspace: new Set(["switch"]) };
-const MULTICA_GLOBAL_VALUE_FLAGS = new Set(["--profile", "--server-url", "--workspace-id"]);
 
 const deny = (rule, reason) => ({ deny: true, rule, reason });
 
@@ -124,7 +118,7 @@ const WRITE_DENY_REASON = {
 const writeDenied = (rule) => deny(rule, WRITE_DENY_REASON[rule]);
 
 // ---------- grants (PLAN 2.12; format in spike/README.md plus kind approval) ----------
-// /xchg/grants/<id>.json: {id, kind: merge|push-main|approval, url | task_id + branch | code, created_at, expires_at?}
+// /xchg/grants/<id>.json: {id, kind: merge|push-main (the bridge also still writes `approval` for done|deny codes; no rule reads it), url | task_id + branch, created_at, expires_at?}
 // created_at / expires_at: epoch ms or ISO string. Effective expiry = min(expires_at, created_at + 24h).
 // The guard only reads this dir. The bridge writes it and deletes it on the runner's grant-used report.
 const GRANT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -282,7 +276,7 @@ const SQL_DROP = /\bdrop\s+(table|database|schema)\b/i;
 // Also matches the shell `truncate <file>`; `truncate -s N file` is not matched. Accepted false positive.
 const SQL_TRUNCATE = /\btruncate\b(\s+table)?\s+(?!-)[\w."`]+/i;
 // Rules whose denial the model can fix by changing the command; every other denial means "the owner runs it".
-const FIXABLE = new Set(["merge-needs-url", "git-push-no-refspec", "git-push-glob", "multica-comment-prefix", "multica-comment-body-unchecked", "memory-write-not-chat-lane", "approval-no-grant", "merge-no-grant", "git-push-protected", "rm-rf-outside-assistant", "grant-already-used", "media-path"]);
+const FIXABLE = new Set(["merge-needs-url", "git-push-no-refspec", "git-push-glob", "memory-write-not-chat-lane", "merge-no-grant", "git-push-protected", "rm-rf-outside-assistant", "grant-already-used", "media-path"]);
 export function denyMessage(v) {
   const tail = FIXABLE.has(v.rule)
     ? "Change the command as the reason says, or do not do this step."
@@ -343,48 +337,6 @@ function rmRules(rest, ctx) {
   return null;
 }
 
-// multica CLI (PLAN 5.2, S11). Gremio's own member account bounds it server-side; this is a speed bump.
-function multicaRules(rest) {
-  let i = 0;
-  while (i < rest.length && rest[i].startsWith("-")) i += MULTICA_GLOBAL_VALUE_FLAGS.has(rest[i]) ? 2 : 1;
-  const [noun, verb, verb2] = [rest[i], rest[i + 1], rest[i + 2]].map((t) => (t && !t.startsWith("-") ? t : undefined));
-  if (STRUCT_NOUNS.has(noun)) {
-    // Allowlist: read verbs and MULTICA_STRUCT_WRITES pass; anything else, including a verb this list does not know, is denied.
-    if (!verb) {
-      // A flag between noun and verb hides the verb from this parser: only bare help passes.
-      const next = rest[i + 1];
-      if (next === undefined || next === "--help" || next === "-h") return null;
-      return deny("multica-structure-write", `put the verb right after "multica ${noun}"; flags before the verb are not allowed`);
-    }
-    if (READ_VERBS.has(verb)) return null;
-    if (noun === "agent" && verb === "skills") {
-      return READ_VERBS.has(verb2) ? null : deny("multica-structure-write", "multica agent skills set|add changes another agent's prompt and is never run by the agent");
-    }
-    if (MULTICA_STRUCT_WRITES[noun]?.has(verb)) return null;
-    return deny("multica-structure-write", `multica ${noun} ${verb} is not on the allowed list (project create|update, agent create|update|skills list, workflow create, workspace switch, reads); never run by the agent`);
-  }
-  if (noun !== "issue") return null;
-  if (verb === "delete") return deny("multica-issue-delete", "multica issue delete is never run by the agent");
-  if (verb !== "comment") return null;
-  if (verb2 === "delete") return deny("multica-comment-delete", "multica issue comment delete is never run by the agent");
-  if (verb2 !== "add" && verb2 !== "update") return null;
-  const args = rest.slice(i + 3);
-  if (args.some((t) => /^--content-(file|stdin)(=|$)/.test(t))) {
-    return deny("multica-comment-body-unchecked", "pass the comment body inline with --content so the guard can check it");
-  }
-  let body = null;
-  for (let k = 0; k < args.length; k++) {
-    if (args[k] === "--content") body = args[k + 1] ?? "";
-    else if (args[k].startsWith("--content=")) body = args[k].slice(10);
-  }
-  if (body === null) return deny("multica-comment-body-unchecked", "pass the comment body inline with --content so the guard can check it");
-  return { body };
-}
-
-function approvalCodes(body) {
-  return [...body.matchAll(APPROVAL_RE)].map((m) => ({ verb: m[1].toLowerCase(), code: m[2].toLowerCase() }));
-}
-
 function argvRules(argv, ctx, depth) {
   const a = realArgv(argv);
   if (!a || depth > 4) return null;
@@ -394,20 +346,8 @@ function argvRules(argv, ctx, depth) {
   if (cmd === "gh") return ghRules(rest, ctx);
   if (cmd === "git") return gitRules(rest, ctx);
   if (cmd === "rm") return rmRules(rest, ctx);
-  if (cmd === "multica") {
-    const r = multicaRules(rest);
-    if (!r || r.deny) return r;
-    if (!/^\s*\[gremio\]/.test(r.body)) return deny("multica-comment-prefix", "every Multica comment starts with [gremio]");
-    const codes = approvalCodes(r.body);
-    const grants = [];
-    for (const { verb, code } of codes) {
-      // The grant records which verb he used: "deny" from him must not be relayed as "done" (and the reverse).
-      const g = findGrant("approval", (x) => String(x.code ?? "").toLowerCase() === code && String(x.verb ?? "").toLowerCase() === verb, ctx);
-      if (!g) return deny("approval-no-grant", `no approval grant for "${verb} ${code}"; the owner must reply exactly that on WhatsApp first`);
-      if (!grants.includes(g.id)) grants.push(g.id);
-    }
-    return grants.length ? { grants, rule: "approval-grant" } : null;
-  }
+  // multica is not guarded (owner decision 2026-11-12: Gremio has full Multica access under its own account, and Multica's own
+  // permissions bound it): no verb, noun or comment rule applies, and a comment needs no prefix or approval grant.
   if (SHELLS.has(cmd)) {
     const k = rest.findIndex((t) => /^-[a-z]*c[a-z]*$/.test(t));
     if (k >= 0 && rest[k + 1]) return bashRules(rest[k + 1], ctx, depth + 1);

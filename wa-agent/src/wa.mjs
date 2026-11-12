@@ -337,7 +337,7 @@ export function createWa({ lib, owners, groups = new Set(), ownerJid, authDir, x
         voterJids: [bare(k.participant), bare(k.participantAlt), bare(k.remoteJid), bare(k.remoteJidAlt), bare(ownerJid)],
       });
     } catch (e) { log(`vote decode failed: ${e.message}`); }
-    Promise.resolve(onVote?.({ pollId, options, voter, owner })).catch((e) => log(`onVote failed: ${e.message}`));
+    Promise.resolve(onVote?.({ pollId, options, voter, owner, chat: dm ? null : bare(k.remoteJid) })).catch((e) => log(`onVote failed: ${e.message}`));
   }
 
   // Media goes to /xchg/inbox (the worker reads it there); the bridge only saves bytes, never parses them (PLAN 5.3).

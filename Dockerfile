@@ -148,6 +148,7 @@ COPY wa-agent/config /opt/wa-agent/config
 COPY wa-agent/hooks /opt/wa-agent/hooks
 COPY wa-agent/mcp /opt/wa-agent/mcp
 COPY wa-agent/src /opt/wa-agent/src
+COPY wa-agent/skills /opt/wa-agent/skills
 
 # --- REA (morluto/rea): npm -g tidak memaksa engines, jadi Node >= 24.22.1 dicek sendiri ---
 RUN node -e 'const [a,b,c]=process.versions.node.split(".").map(Number); if(!(a>24||(a===24&&(b>22||(b===22&&c>=1))))){console.error("REA butuh Node >= 24.22.1, ada "+process.versions.node);process.exit(1)}' \
@@ -155,7 +156,7 @@ RUN node -e 'const [a,b,c]=process.versions.node.split(".").map(Number); if(!(a>
     && npm cache clean --force \
     && rea --version
 
-# --- Skill: tepat lima aset (mattpocock dari manifest plugin, antislop enam dir, REA, TypeSafe) ke /opt/agent-assets/skills ---
+# --- Skill: lima aset (mattpocock dari manifest plugin, antislop enam dir, REA, TypeSafe) plus skill lokal wa-agent/skills ke /opt/agent-assets/skills ---
 RUN T="$(mktemp -d)" \
     && /opt/wa-agent/build/fetch-sha.sh https://github.com/miqdadbadjuber/anti-slop "${ANTISLOP_SHA}" "$T/as" skills \
     && /opt/wa-agent/build/fetch-sha.sh https://github.com/morluto/rea "${REA_SKILL_SHA}" "$T/rea" .agents/skills/reverse-engineer-anything \
