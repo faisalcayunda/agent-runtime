@@ -126,7 +126,12 @@ export function normalizeMessage(msg) {
 }
 
 // ---------- poll votes (Hermes bridge_helpers.js pollUpdateForAggregation, condensed) ----------
-export const pollSecret = (creation) => creation?.message?.messageContextInfo?.messageSecret ?? creation?.messageContextInfo?.messageSecret ?? null;
+// A sent or received WebMessageInfo is a protobufjs object: JSON.stringify calls its toJSON first, which turns bytes into base64
+// strings before BufferJSON.replacer sees them, so state.json holds the secret as base64. As a string HMAC key it decrypts nothing.
+export const pollSecret = (creation) => {
+  const s = creation?.message?.messageContextInfo?.messageSecret ?? creation?.messageContextInfo?.messageSecret ?? null;
+  return s === null ? null : typeof s === "string" ? Buffer.from(s, "base64") : Buffer.from(s);
+};
 const uniq = (a) => [...new Set(a.map((x) => String(x ?? "").trim()).filter(Boolean))];
 
 // creation: the persisted sent poll message (decoded). lib: {decryptPollVote, getAggregateVotesInPollMessage, getKeyAuthor}.
@@ -273,7 +278,7 @@ export function createWa({ lib, owners, groups = new Set(), ownerJid, authDir, x
         try { const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(msg.key.remoteJid); if (pn) msg.key.remoteJidAlt = pn; } catch { /* no mapping yet */ }
       }
       if (!isOwnerMessage(msg, owners) && /@lid$/.test(msg.key?.remoteJid ?? "")) await addOwnerLids();
-      if (!isOwnerMessage(msg, owners)) { log(`dropped message from ${String(msg.key?.remoteJid).replace(/\d(?=\d{4})/g, "*")}`); return; }
+      if (!isOwnerMessage(msg, owners)) { if (!msg.key?.fromMe) log(`dropped message from ${String(msg.key?.remoteJid).replace(/\d(?=\d{4})/g, "*")}`); return; }
       const n = normalizeMessage(msg);
       const quoted = quotedOf(msg, { self: selfIds(), owners });
       if (quoted) n.quoted = quoted;
@@ -334,7 +339,7 @@ export function createWa({ lib, owners, groups = new Set(), ownerJid, authDir, x
       options = decodeVote({
         creation, pollUpdate, meId: me, lib,
         creatorJids: [lid, me, bare(author.participant), bare(author.participantAlt), /@g\.us$/.test(author.remoteJid ?? "") ? "" : bare(author.remoteJid)], // our own poll, or the creator of someone else's
-        voterJids: [bare(k.participant), bare(k.participantAlt), bare(k.remoteJid), bare(k.remoteJidAlt), bare(ownerJid)],
+        voterJids: [bare(k.participant), bare(k.participantAlt), bare(k.remoteJid), bare(k.remoteJidAlt), bare(ownerJid), ...(owner ? owners : [])], // the owner's client may sign with his LID in a phone-addressed chat
       });
     } catch (e) { log(`vote decode failed: ${e.message}`); }
     Promise.resolve(onVote?.({ pollId, options, voter, owner, chat: dm ? null : bare(k.remoteJid) })).catch((e) => log(`onVote failed: ${e.message}`));

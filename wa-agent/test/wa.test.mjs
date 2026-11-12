@@ -143,6 +143,45 @@ test("the sent poll is persisted with its messageSecret and getMessage serves it
   assert.deepEqual(await F.sockets[0].cfg.getMessage({ id: "unknown" }), { conversation: "" });
 });
 
+// A vote encrypted the way WhatsApp clients do it (the inverse of rc13 Utils/process-message.js decryptPollVote; rc13 exports no encryptor).
+function encryptVote({ secret, pollMsgId, pollCreatorJid, voterJid, label }) {
+  const key0 = baileys.hmacSign(secret, new Uint8Array(32));
+  const key = baileys.hmacSign(Buffer.concat([Buffer.from(pollMsgId), Buffer.from(pollCreatorJid), Buffer.from(voterJid), Buffer.from("Poll Vote"), Buffer.from([1])]), key0);
+  const encIv = Buffer.from("0123456789ab");
+  const plain = baileys.proto.Message.PollVoteMessage.encode({ selectedOptions: [baileys.sha256(Buffer.from(label))] }).finish();
+  return { encPayload: baileys.aesEncryptGCM(plain, key, encIv, Buffer.from(`${pollMsgId}\u0000${voterJid}`)), encIv };
+}
+
+test("the owner's vote on Gremio's own DM poll decrypts from state.json, with the voter and creator in phone or LID form", async () => {
+  const S = sandbox();
+  const { F, wa, got, polls } = await startWa(S);
+  const secrets = {};
+  // the real sent message (a protobuf WebMessageInfo, as rc13 sendMessage returns it), not a plain object
+  F.sockets[0].sendMessage = async (jid, content, opts) => {
+    const sent = await baileys.generateWAMessage(jid, content, { userJid: "99:1@s.whatsapp.net", messageId: opts?.messageId, upload: async () => ({}) });
+    secrets[sent.key.id] = sent.message.messageContextInfo.messageSecret;
+    return sent;
+  };
+  const p = await wa.sendPoll("Lanjut?", ["ya", "nanti"], { id: messageId("q1") });
+  polls.set(p.id, p.raw);
+  let n = 0;
+  const vote = (chat, pollCreatorJid, voterJid) => ({
+    key: { id: `V${++n}`, remoteJid: chat, fromMe: false }, messageTimestamp: 1_800_000_001,
+    message: { pollUpdateMessage: { pollCreationMessageKey: { id: p.id, remoteJid: chat, fromMe: true }, senderTimestampMs: 1, vote: encryptVote({ secret: secrets[p.id], pollMsgId: p.id, pollCreatorJid, voterJid, label: "ya" }) } },
+  });
+  for (const chat of [OWNER, "999@lid"]) for (const creator of ["99@s.whatsapp.net", "77@lid"]) for (const voter of [OWNER, "999@lid"]) {
+    const before = got.votes.length;
+    await F.handlers["messages.upsert"]({ type: "notify", messages: [vote(chat, creator, voter)] });
+    await waitFor(() => got.votes.length === before + 1);
+    assert.deepEqual(got.votes.at(-1), { pollId: p.id, options: ["ya"], voter: "owner", owner: true, chat: null }, `${chat} ${creator} ${voter}`);
+  }
+  // the same payload from a stranger's DM never reaches the bridge
+  const before = got.votes.length;
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [vote("628222@s.whatsapp.net", "99@s.whatsapp.net", "628222@s.whatsapp.net")] });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(got.votes.length, before);
+});
+
 test("the socket config carries the proxy agent for both the websocket and media, and no QR print", async () => {
   const S = sandbox();
   const agent = new ProxyAgent("http://wa-egress:8888");
@@ -270,6 +309,7 @@ test("upsert: group messages reach the bridge only through the gate, and nothing
     gm({ id: "u5" }, "gremio cek"),                                                      // family, addressed
     gm({ id: "u6", remoteJid: OTHER, participant: OWNER }, "gremio cek"),                // owner, other group, addressed
     gm({ id: "u7", remoteJid: "628222@s.whatsapp.net", participant: undefined }, "gremio cek"), // DM from a stranger
+    m({ id: "u8", remoteJid: OWNER, fromMe: true }, { conversation: "pesan Gremio sendiri" }),   // our own send coming back
   ] });
   assert.deepEqual(got.messages.map((x) => x.id), ["u5", "u6"]);
   assert.deepEqual(got.messages[0].group, { jid: FAM, fromOwner: false, family: true, name: "Budi", jids: [MEMBER], quote: { key: { id: "u5", remoteJid: FAM, participant: MEMBER }, message: { conversation: "gremio cek" } } });

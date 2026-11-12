@@ -10,6 +10,7 @@ import { openState } from "../src/state.mjs";
 import { fakeBin, sandbox, tmp, waitFor, REF_KEY, keyed } from "../testlib/helpers.mjs";
 import { attach } from "../src/ipc.mjs";
 import { addRef } from "../src/wa-actions.mjs";
+import { generateAck, generateReactEmoji } from "../src/ack.mjs";
 // The ref the bridge gives a message of a lane (4 hex characters of a hash, stable for the same lane and id).
 const rf = (lane, id) => addRef({ refs: {}, refKey: REF_KEY }, lane, { id }).ref;
 import { connect, startRunner } from "../testlib/harness.mjs";
@@ -609,6 +610,33 @@ async function fakeRouter(t, handler) {
 }
 const says = (text) => (req, res) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ id: "msg_1", type: "message", content: [{ type: "text", text }] })); };
 const TOKEN = "tok-SECRET-9f3a";
+
+// 9router (seen 2026-11-12) answers with content-type text/event-stream: sometimes a plain JSON message, sometimes real SSE frames.
+test("router call asks for stream false and reads a JSON body or SSE frames whatever the content-type; garbage is null with only the error class", async (t) => {
+  const sse = (...texts) => (req, res) => {
+    res.setHeader("content-type", "text/event-stream");
+    const ev = (type, data) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+    res.end(ev("message_start", { message: { id: "msg_1", type: "message", content: [] } }) + ev("content_block_start", { index: 0, content_block: { type: "text", text: "" } })
+      + texts.map((text) => ev("content_block_delta", { index: 0, delta: { type: "text_delta", text } })).join("") + ev("content_block_stop", { index: 0 }) + ev("message_stop", {}));
+  };
+  const jsonAsSse = (text) => (req, res) => { res.setHeader("content-type", "text/event-stream"); res.end(JSON.stringify({ model: "claude-sonnet-5", type: "message", content: [{ type: "text", text }] })); };
+  const garbage = (req, res) => { res.setHeader("content-type", "text/event-stream"); res.end(`data: {not json ${TOKEN}\n\n<html>`); };
+  const call = async (handler, fn = generateAck) => {
+    const router = await fakeRouter(t, handler), why = [];
+    const out = await fn({ baseUrl: router.url, token: TOKEN, model: "role-exec-lite", trigger: "cek deploy", failed: (w) => why.push(w) });
+    return { out, why, body: JSON.parse(router.reqs[0].body) };
+  };
+  const a = await call(jsonAsSse("Lagi aku cek deploy-nya."));
+  assert.deepEqual([a.out, a.why, a.body.stream], ["Lagi aku cek deploy-nya.", [], false]);
+  const b = await call(sse("Lagi aku ", "cek deploy-nya."));
+  assert.deepEqual([b.out, b.why], ["Lagi aku cek deploy-nya.", []]);
+  const e = await call(sse("🔍"), generateReactEmoji);
+  assert.deepEqual([e.out, e.body.stream], ["🔍", false]);
+  const g = await call(garbage);
+  assert.equal(g.out, null);
+  assert.equal(g.why.length, 1);
+  assert.equal(g.why.join("").includes(TOKEN) || g.why.join("").includes("not json"), false); // the error class only, never the body
+});
 
 // A runner with a running chat turn (fake claude hangs), and a bridge connection to it.
 async function runnerWithTurn(t, env, opts = {}) {

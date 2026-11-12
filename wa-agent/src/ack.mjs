@@ -80,14 +80,32 @@ function postJson(url, headers, payload, timeoutMs) {
   });
 }
 
+// The first text block of a Messages API answer. The router may send a plain JSON message or SSE frames (message_start, then
+// content_block_* deltas) under either content-type, so the body decides. Throws on anything else (the caller logs only the class).
+function messageText(raw) {
+  if (raw.trim().startsWith("{")) return JSON.parse(raw)?.content?.find?.((b) => b?.type === "text")?.text ?? null;
+  let msg = null, idx = null, text = "", frames = 0;
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.startsWith("data:") || line.slice(5).trim() === "[DONE]") continue;
+    const ev = JSON.parse(line.slice(5));
+    frames++;
+    if (ev?.type === "error") throw new Error("router stream error");
+    if (ev?.type === "message_start") msg = ev.message;
+    if (ev?.type === "content_block_start" && ev.content_block?.type === "text" && idx === null) { idx = ev.index; text = ev.content_block.text ?? ""; }
+    if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta" && (idx ?? ev.index) === ev.index) { idx = ev.index; text += ev.delta.text ?? ""; }
+  }
+  if (!frames) throw new SyntaxError("not a message");
+  return idx !== null ? text : msg?.content?.find?.((b) => b?.type === "text")?.text ?? null;
+}
+
 // One router call; resolves the first text block, or null (never throws). `failed(why)` gets a reason that cannot hold the credential.
 async function routerText({ baseUrl, token, header, body, timeoutMs, failed }) {
   try {
-    const payload = JSON.stringify(body);
+    const payload = JSON.stringify({ ...body, stream: false }); // said outright: the router may otherwise stream
     const headers = { "content-type": "application/json", "content-length": Buffer.byteLength(payload), "anthropic-version": "2023-06-01", ...(header === "x-api-key" ? { "x-api-key": token } : { authorization: `Bearer ${token}` }) };
     const r = await postJson(`${baseUrl.replace(/\/+$/, "")}/v1/messages`, headers, payload, timeoutMs);
     if (r.status !== 200) { failed(`router answered ${r.status}`); return null; }
-    return JSON.parse(r.body)?.content?.find?.((b) => b?.type === "text")?.text ?? null;
+    return messageText(r.body);
   } catch (e) {
     failed(`call failed: ${e?.code ?? e?.name ?? "error"}`);
     return null;
