@@ -94,7 +94,7 @@ export function renderQuestion(head, { group = false } = {}) {
   return `${n}${q.question}${list ? "\n" + list : ""}${how}`;
 }
 
-export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, actionMs = ACTION_MS, log = () => {}, setTimer = (f, ms) => { const t = setTimeout(f, ms); t.unref(); return t; }, clearTimer = clearTimeout, ackMs = ACK_MS, reactMs = REACT_MS, ackTextMs = ACK_TEXT_MS, reactEmojiMs = REACT_EMOJI_MS, statusMs = 2000 }) {
+export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, actionMs = ACTION_MS, log = () => {}, setTimer = (f, ms) => { const t = setTimeout(f, ms); t.unref(); return t; }, clearTimer = clearTimeout, ackMs = ACK_MS, reactMs = REACT_MS, ackTextMs = ACK_TEXT_MS, reactEmojiMs = REACT_EMOJI_MS, statusMs = 2000, autoReact = true }) {
   const S = state.d;
   const save = () => state.save();
   const known = (id) => id === "chat" || (validId(id) && !!S.lanes[id]);
@@ -214,6 +214,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     const body = items.map(piece).filter(Boolean).join("\n\n");
     const seen = body ? takeNotes(id) : ""; // reactions, tallies and polls since the last turn ride along; they never start one and never join an empty-prompt resume
     const videos = items.flatMap((i) => i.videos ?? []);
+    spoke.delete(id);
     L.inflight = { raw, ids: items.map((i) => i.id).filter(Boolean), answered: items.find((i) => i.answered)?.answered ?? null, ...(videos.length ? { videos } : {}), ...(group ? { fromOwner: items[0].fromOwner === true } : {}) };
     if (group && items[0].quote) L.quote = items[0].quote;
     save();
@@ -277,7 +278,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   }
   const deferReact = (id, key, group, text = "") => {
     cancelReact(id);
-    if (!key) return;
+    if (!key || !autoReact) return; // owner 2026-11-12: off in production, Gremio reacts only when it fits (wa_react)
     if (reactMs <= 0) return react(key, group);
     const r = { timer: null, dead: false };
     r.timer = setTimer(() => { fireReact(id, r, key, group, String(text).slice(0, REACT_TRIGGER_MAX)).catch((e) => log(`reaction failed: ${e.message}`)); }, reactMs);
@@ -575,6 +576,8 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   const fail = (msg) => { throw new Error(msg); };
   const keyOf = (it) => (it.mine ? { id: it.id, fromMe: true, ...(it.chat ? { remoteJid: it.chat } : {}) } : { id: it.id, remoteJid: it.chat, ...(it.from ? { participant: it.from } : {}), fromMe: false });
   // Model-authored text that only narrates the model's own action ("(reacted 🍢)") is never sent; one log line, 40 characters of it.
+  // Lanes that have already spoken through an action tool in the running turn: the turn's later plain text only narrates it ("Selesai dikirim"), so it is not sent.
+  const spoke = new Set();
   const narration = (where, text) => { if (!isActionNarration(text)) return false; log(`dropped narration in ${where}: ${String(text).trim().slice(0, 40)}`); return true; };
   const textArg = (v, what = "text") => { const t = String(v ?? "").trim(); if (!t || t.length > MAX_TEXT) fail(`${what} must be 1 to ${MAX_TEXT} characters`); return t; };
   const escapeRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -638,6 +641,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     const o = group ? { jid: to.jid } : {};
     const id = messageId(`act:${m.rid}`);
     const shown = () => { cancelAck(lane); cancelReact(lane); }; // a visible action answers the message: no 👀 or progress line after it
+    const said = () => { shown(); spoke.add(lane); }; // reply, media, poll and mention: the turn has spoken
     const sent = (text, kind = "text") => { const it = recordSent(lane, id, text, to?.jid ?? null, kind); save(); return { ref: `#${it.ref}` }; };
     switch (m.action) {
       case "react": {
@@ -654,7 +658,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
         accept();
         const r = sent(text);
         await wa.reply(text, { key: keyOf(it), message: { conversation: it.text ?? "" } }, { ...o, id });
-        shown();
+        said();
         return r;
       }
       case "media": {
@@ -666,7 +670,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
         accept();
         const r = sent(caption || `[${kind}]`, "media");
         await wa.sendMedia({ kind, data, mimetype: mimeOf(kind, name), fileName: name, caption }, { ...o, id });
-        shown();
+        said();
         return r;
       }
       case "poll": {
@@ -680,7 +684,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
         const p = await wa.sendPoll(question, options, { ...o, id, multi });
         const r = sent(question, "poll");
         if (typeof p.raw === "string" && p.raw.length <= OWN_POLL_RAW_MAX) S.xpolls[p.id] = { raw: p.raw, lane, ref: r.ref.slice(1), question, options, own: true, multi, votes: {}, ts: now() }; // votes come back as events (voteOnPoll)
-        shown();
+        said();
         save();
         return r;
       }
@@ -700,7 +704,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
         accept();
         const r = sent(text);
         await wa.sendMention(text, [...new Set(jids)], { ...o, id });
-        shown();
+        said();
         return r;
       }
       case "edit": {
@@ -814,6 +818,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       case "text": { // a task lane's text is never sent; a group lane's goes to its own group
         if (typeof m.key !== "string" || m.key.length > 200) return;
         if (narration(`text ${m.lane}`, m.text)) return;
+        if (spoke.has(m.lane) && (m.lane === "chat" || isGroupLane(m.lane))) return log(`dropped text after an action in ${m.lane}: ${String(m.text ?? "").trim().slice(0, 40)}`);
         if (String(m.text ?? "").trim()) { cancelAck(m.lane); cancelReact(m.lane); }
         if (m.lane === "chat") return sendOnce(`t:${m.key}`, String(m.text ?? ""));
         const to = laneDest(m.lane);
@@ -837,6 +842,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
           save();
         }
         if (m.kind === "done" && m.lane !== "chat") { lane(m.lane).done = true; save(); } // the chat lane never ends
+        spoke.add(m.lane);
         return sendOnce(`n:${m.nid ?? now()}`, String(m.text ?? ""));
       }
     }
@@ -850,6 +856,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     // The runner has its frames by now and cannot delete from the bridge-owned inbox: the video goes with the turn.
     for (const v of L.inflight?.videos ?? []) { try { unlinkSync(inside(join(xchg, "inbox"), v.name)); } catch { /* gone */ } }
     L.inflight = null;
+    spoke.delete(m.lane);
     const fresh = L.fresh;
     L.fresh = false;
     if (validSession(m.sessionId) && !fresh) S.sessions[m.lane] = m.sessionId;
@@ -922,7 +929,7 @@ async function main() {
     fetchVersion: env.WA_FETCH_VERSION !== "0", qr: (q) => qrt.generate(q, { small: true }), log,
     onMessage: (n) => core.onMessage(n), onVote: (v) => core.onVote(v), onSeen: (n) => core.onSeen(n), onReaction: (r) => core.onReaction(r), onOpen: () => core.onOpen(),
   });
-  core = createCore({ state, xchg, wa, toRunner, groups, log });
+  core = createCore({ state, xchg, wa, toRunner, groups, log, autoReact: env.WA_AUTO_REACT === "1" });
   const health = createHealth({ url: env.PING_BRIDGE_URL, isOpen: () => wa.isOpen(), get: (u) => httpGet(u, { agent }), log });
   health.start();
   core.sweep();

@@ -38,6 +38,7 @@ The voice rules in `voice.md` and `voice-group.md` still decide tone (Indonesian
 
 - Several unrelated points: 2 or 3 short messages beat one wall of text. Split at a natural break, not mid-thought. Say it once.
 - Do not narrate ("lagi aku cek pakai tool"). Report the result, or stay silent until you have one.
+- When you answered with `wa_reply`, `notify_owner`, `wa_poll` or `wa_send_media`, end the turn without any further text; never summarise what you just sent.
 - One action burst per incoming message: a reaction, or a reply, or a file. The limit is 6 actions a minute and 30 an hour per chat. When a tool returns a rate-limit error, wait the stated seconds and fold what you wanted to say into one text.
 
 ## Groups
