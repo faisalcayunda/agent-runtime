@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // MCP server `owner` (PLAN 2.3, 2.11, 2.12). Spawned by claude per lane (WA_LANE and WA_TASK_ID reach it through
 // mcp.json env expansion, UNVERIFIED until phase 1/4). Tools:
-//   permission    target of --permission-prompt-tool: denies AskUserQuestion and ExitPlanMode (2.3) and whatever
+//   permission    target of --permission-prompt-tool: allows an AskUserQuestion whose answer file exists, else denies it (retry
+//                 alone, 2.3), denies ExitPlanMode and whatever
 //                 hooks/guard.mjs denies; allows the rest. Raw arguments are logged (shape not documented).
 //   ask_owner     rank 3, blocking, over the runner socket
 //   start_task    chat lane only: asks the runner for a task lane
@@ -18,6 +19,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { evaluate, denyMessage, CODE_RE } from "../hooks/guard.mjs";
+import { readAnswers } from "../hooks/ask-defer.mjs";
 import { attach, send } from "../src/ipc.mjs";
 
 const NEEDS_UPDATED_INPUT = new Set(["AskUserQuestion", "ExitPlanMode"]);
@@ -26,6 +28,12 @@ const SOCK = () => process.env.WA_SOCK || "/xchg/sock/run.sock";
 export function decide(args, { home, xchg = "/xchg", lane, task, cwd } = {}) {
   const tool = args?.tool_name;
   if (typeof tool !== "string") return { behavior: "deny", message: "permission request has no tool_name" };
+  // Spike T2 (PLAN section 8): after the defer hook allows an answered AskUserQuestion, Claude Code still calls this tool for
+  // it, with the deferred id as tool_use_id. Allow it with the answers the bridge wrote; otherwise the retry-alone deny stays.
+  if (tool === "AskUserQuestion" && args.input && typeof args.input === "object" && !Array.isArray(args.input)) {
+    const answers = readAnswers(xchg, args.tool_use_id);
+    if (answers) return { behavior: "allow", updatedInput: { ...args.input, answers } }; // questions come from Claude, answers from the file
+  }
   if (NEEDS_UPDATED_INPUT.has(tool)) return { behavior: "deny", message: `${tool} must be called alone, in a turn with no other tool call. Call it again by itself.` };
   const input = args.input && typeof args.input === "object" && !Array.isArray(args.input) ? args.input : {};
   const { verdict } = evaluate({ tool_name: tool, tool_input: input, cwd }, { home, xchg, lane, task });
@@ -72,7 +80,7 @@ export async function callTool(name, args, env = process.env) {
   };
   const show = (r, ok) => (r.ok ? reply(ok(r)) : reply(r.error ?? "failed", true));
   switch (name) {
-    case "start_task": return show(await rpc("start_task", { issue: String(args.issue ?? "") }), (r) => (r.status === "queued" ? `queued: both task lanes are busy (position ${r.position}); tell Lord Faisal it waits` : `task ${r.status}`));
+    case "start_task": return show(await rpc("start_task", { issue: String(args.issue ?? "") }), (r) => (r.status === "queued" ? `queued: the task lane limit is reached (position ${r.position}); tell Lord Faisal it waits` : `task ${r.status}`));
     case "track_issue": return show(await rpc("track_issue", { issue: String(args.issue ?? ""), role: args.role }), () => "tracked");
     case "wiki_capture": return show(await rpc("wiki_capture", {}, { timeoutMs: 180000 }), (r) => (r.ran ? `wiki sync: ${r.status ?? "done"}${r.branch ? ` (the pages conflicted with main and went to branch ${r.branch}; Lord Faisal was told)` : ""}` : "wiki sync is not installed yet"));
     case "ask_owner": return show(await rpc("ask_owner", { question: String(args.question ?? "") }, { timeoutMs: 0 }), (r) => r.answer);

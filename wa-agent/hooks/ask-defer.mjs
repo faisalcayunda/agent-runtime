@@ -8,10 +8,12 @@
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { validId } from "../src/ids.mjs";
 
-function readAnswers(xchg, id) {
-  // The id becomes a file name: allow only what a tool_use id can contain.
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) return null;
+// The answers the bridge wrote for a tool_use id, or null. Shared with the owner MCP's permission tool, which has to
+// answer the same call (spike T2: Claude Code still asks the permission tool after this hook allows).
+export function readAnswers(xchg, id) {
+  if (!validId(id)) return null; // the id becomes a file name: only what a tool_use id can contain
   try {
     const a = JSON.parse(readFileSync(join(xchg, "answers", `${id}.json`), "utf8")).answers;
     return a && typeof a === "object" && !Array.isArray(a) ? a : null;

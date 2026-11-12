@@ -10,14 +10,16 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, existsSync, fstatSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { LineSplitter, parseLine } from "./stream.mjs";
+import { LineSplitter, parseLine, pickResult } from "./stream.mjs";
 import { attach, send } from "./ipc.mjs";
 import { resetPolicy } from "./reset.mjs";
 import { inside, validFile, validId } from "./ids.mjs";
 
 const CODE_RE = /^[a-z0-9]{3,8}-[0-9]{3,6}$/i;
 
-export const MAX_TASK_LANES = 2;
+// D20 (PLAN 2.5, section 8: three lanes peaked at 482 MiB anon+kernel, 786 MiB with margin against 700): one task lane by
+// default. WA_MAX_TASK_LANES may raise it to 2; any other value means 1.
+export const maxTaskLanes = (v) => (v === "2" ? 2 : 1);
 const MAX_BUFFER = 500; // events kept for a bridge that is away
 
 // Variables a turn may see (PLAN 2.2). Anything else in the container never reaches `claude`.
@@ -77,6 +79,7 @@ export function createRunner(opts) {
   const regPath = opts.registry ?? join(home, ".wa-runner", "registry.json");
   const guardLog = join(home, ".claude", "guard.log");
   const eventPollMs = opts.eventPollMs ?? 3000;
+  const MAX_TASK_LANES = opts.maxTaskLanes ?? maxTaskLanes(srcEnv.WA_MAX_TASK_LANES);
   const log = opts.log ?? ((m) => process.stderr.write(`runner: ${m}\n`));
   const doReset = opts.reset ?? (() => resetPolicy({ home, assets: { skills: join(assetsDir, "skills"), agents: join(assetsDir, "agents"), claudeMd: join(agentDir, "config", "CLAUDE.md") } }));
 
@@ -151,16 +154,20 @@ export function createRunner(opts) {
     const lane = String(req.lane ?? "");
     if (lane !== "chat" && !validId(lane)) return toBridge({ ev: "result", lane, error: "bad lane id" });
     if (lanes.has(lane)) return toBridge({ ev: "busy", lane });
-    let argv;
-    try {
-      argv = buildArgv({ prompt: req.prompt ?? "", session: req.session || null, model, mcpConfig: join(agentDir, "config", "mcp.json"), voice: join(agentDir, "config", "voice.md"), permissionMode });
-    } catch (e) { return toBridge({ ev: "result", lane, error: e.message }); }
-    const entry = { stderr: "", killed: false, proc: null, origin: req.origin ?? null, result: null };
-    lanes.set(lane, entry); // the lane is busy from here on, also while the wiki refresh below runs
-    // A turn with a prompt runs the wiki-retrieve hook (every chat prompt, every task-lane turn that has one): refresh the clone
-    // first. An empty-prompt resume retrieves nothing. Fail soft: a refresh that errors or hangs never blocks the turn.
-    const go = () => startClaude(lane, req, argv, entry);
-    if ((req.prompt ?? "") !== "") wikiRefresh().then(go, go); else go();
+    const argvFor = (prompt) => buildArgv({ prompt, session: req.session || null, model, mcpConfig: join(agentDir, "config", "mcp.json"), voice: join(agentDir, "config", "voice.md"), permissionMode });
+    try { argvFor(req.prompt ?? ""); } catch (e) { return toBridge({ ev: "result", lane, error: e.message }); } // an empty or fable model fails here
+    const entry = { stderr: "", killed: false, proc: null, origin: req.origin ?? null, final: null };
+    lanes.set(lane, entry); // the lane is busy from here on, also while the wiki work below runs
+    // A turn with a real prompt (every chat prompt, every task-lane turn that has one) first refreshes the clone and then gets
+    // the wiki-retrieve context prepended here. The UserPromptSubmit hook cannot do this: it does not fire on an empty-prompt
+    // resume and fires with a synthetic prompt after an answer (spike T13). Resumes retrieve nothing. Fail soft throughout.
+    const prompt = req.prompt ?? "";
+    const go = async () => {
+      let ctx = "";
+      if (prompt !== "") { await wikiRefresh().catch(() => {}); ctx = await wikiContext(prompt).catch(() => ""); }
+      startClaude(lane, req, argvFor(ctx ? `${ctx}\n\n${prompt}` : prompt), entry);
+    };
+    go();
   }
 
   function startClaude(lane, req, argv, entry) {
@@ -180,7 +187,8 @@ export function createRunner(opts) {
         else if (ev.type === "tool_result") drainGuardLog(lane);
         else if (ev.type === "result") {
           // Held until the process exits: the lane is busy until then, and a resume sent on `result` would race it.
-          entry.result = { ev: "result", lane, sessionId: ev.sessionId, stopReason: ev.stopReason, isError: ev.isError, subtype: ev.subtype, deferred: ev.deferred, durationMs: ev.durationMs, usage: ev.usage, modelUsage: ev.modelUsage, denials: ev.denials.length, error: ev.isError ? ev.text.slice(0, 300) : undefined };
+          // One process can emit several results; the turn's is the last one with a non-null stop_reason (spike section 8).
+          entry.final = pickResult(entry.final, ev);
         }
       }
     };
@@ -194,7 +202,8 @@ export function createRunner(opts) {
       drainGuardLog(lane);
       lanes.delete(lane);
       tokens.delete(lane);
-      toBridge(entry.result ?? { ev: "result", lane, error: entry.killed ? "stopped" : `claude exited ${code ?? signal}: ${entry.stderr.trim().slice(-300)}` });
+      const f = entry.final;
+      toBridge(f ? { ev: "result", lane, sessionId: f.sessionId, stopReason: f.stopReason, resultIndex: f.resultIndex, isError: f.isError, subtype: f.subtype, deferred: f.deferred, durationMs: f.durationMs, usage: f.usage, modelUsageSince: f.modelUsageSince, totalCostUsd: f.totalCostUsd, error: f.isError ? f.text.slice(0, 300) : undefined } : { ev: "result", lane, error: entry.killed ? "stopped" : `claude exited ${code ?? signal}: ${entry.stderr.trim().slice(-300)}` });
       checkShutdown();
     });
   }
@@ -304,6 +313,28 @@ export function createRunner(opts) {
       const t = setTimeout(() => { try { p.kill("SIGTERM"); } catch { /* gone */ } res(); }, opts.wikiRefreshTimeoutMs ?? 30000);
       p.on("error", (e) => { clearTimeout(t); log(`wiki refresh: ${e.message}`); res(); });
       p.on("close", () => { clearTimeout(t); res(); });
+    });
+  }
+
+  // Wiki context for a prompt: hooks/wiki-retrieve.py (the UserPromptSubmit port) run here with the prompt on stdin. Returns the
+  // additionalContext text, capped, or "" for no match, no script, a failure or a timeout.
+  const MAX_WIKI_CONTEXT = 6000;
+  function wikiContext(prompt) {
+    const script = join(agentDir, "hooks", "wiki-retrieve.py");
+    if (!existsSync(script)) return Promise.resolve("");
+    return new Promise((res) => {
+      let out = "", p;
+      try { p = spawn("python3", ["-I", script], { env: { HOME: srcEnv.HOME ?? home, PATH: srcEnv.PATH }, stdio: ["pipe", "pipe", "ignore"] }); } catch { return res(""); }
+      const t = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* gone */ } res(""); }, opts.wikiRetrieveTimeoutMs ?? 5000);
+      p.on("error", () => { clearTimeout(t); res(""); });
+      p.stdout.on("data", (c) => { if (out.length < 65536) out += c; });
+      p.on("close", (code) => {
+        clearTimeout(t);
+        if (code !== 0) return res("");
+        try { const c = JSON.parse(out)?.hookSpecificOutput?.additionalContext; res(typeof c === "string" ? c.trim().slice(0, MAX_WIKI_CONTEXT) : ""); } catch { res(""); }
+      });
+      p.stdin.on("error", () => {});
+      p.stdin.end(JSON.stringify({ prompt, session_id: "", cwd: "" }));
     });
   }
 

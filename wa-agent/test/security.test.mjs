@@ -1,6 +1,6 @@
 // Security review fixes (B1-B5 and minors 1, 2, 4, 5, 6, 7, 9, 10, 13). Every test here was run against the code as it
 // was before the fix and failed there; the matching probe scripts reproduced the same defects.
-// Fields assumed: see runner.test.mjs and src/stream.mjs headers (synthetic fixtures); guard hook input fields as in
+// Fields assumed: see runner.test.mjs and src/stream.mjs headers (recorded and synthetic fixtures, see fixtures/SOURCES.json); guard hook input fields as in
 // guard.test.mjs.
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -428,7 +428,7 @@ test("minor 7: the runner buffers events while the bridge is away and replays th
   const b2 = await connect(R.sock, { role: "bridge" });
   const r = await b2.wait((e) => e.ev === "result", 3000);
   assert.equal(r.lane, "chat");
-  assert.equal(b2.of("text")[0].text, "Halo Lord Faisal, ini jawaban singkat.");
+  assert.equal(b2.of("text")[0].text, "ok"); // the recorded plain turn
   assert.deepEqual(b2.of("hello")[0].buffered, ["chat"]); // tells the bridge not to resume that lane itself
 });
 

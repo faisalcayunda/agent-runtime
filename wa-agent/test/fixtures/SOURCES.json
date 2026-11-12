@@ -1,10 +1,11 @@
 {
-  "_note": "All fixtures are SYNTHETIC until phase 1 records real stream-json. Replace a file with its recorded twin of the same name; the placeholder __SID__ is substituted by testlib/fake-claude.mjs, recorded files do not need it.",
-  "plain.jsonl": {"origin": "synthetic", "stands_for": "T8 no-tool question"},
-  "deferred.jsonl": {"origin": "synthetic", "stands_for": "T2 step 1 (tool_deferred)"},
-  "answered.jsonl": {"origin": "synthetic", "stands_for": "T2 step 3 (resume after answer)"},
-  "parallel-deny.jsonl": {"origin": "synthetic", "stands_for": "T3 parallel call, permission tool deny, retry alone"},
-  "guard-deny.jsonl": {"origin": "synthetic", "stands_for": "T5 guard denial"},
+  "_note": "REAL = trimmed recording from the phase 1 spike (spike/results, claude 2.1.322, model role-exec via 9router, PLAN section 8): init tool lists, thinking text and signatures, and long tool output are cut, session_id is replaced by __SID__ (testlib/fake-claude.mjs substitutes it), everything else is as recorded. SYNTHETIC = written by hand because no recording exists. A real file replaces a synthetic twin by name.",
+  "plain.jsonl": {"origin": "real", "source": "spike/results/t8.jsonl, first turn", "stands_for": "T8 no-tool question"},
+  "deferred.jsonl": {"origin": "real", "source": "spike/results/t2-step1.jsonl", "stands_for": "T2 step 1: AskUserQuestion, stop_reason tool_deferred, deferred_tool_use"},
+  "answered.jsonl": {"origin": "real", "source": "spike/results/rerun-2026-11-12/t2b.jsonl, second turn", "stands_for": "T2 rerun (b): resume after the answer; command_lifecycle and attachment lines are ignored types"},
+  "parallel.jsonl": {"origin": "real", "source": "spike/results/t3.jsonl", "stands_for": "T3: AskUserQuestion and Bash in one message (one line per block, shared message.id); the defer hook wins, Bash runs, the turn ends tool_deferred"},
+  "guard-deny.jsonl": {"origin": "real", "source": "spike/results/t5.jsonl", "stands_for": "T5: six PreToolUse hook denials as <tool_use_error> tool_results, permission_denials empty"},
+  "multi-result.jsonl": {"origin": "real", "source": "spike/results/t12.jsonl, the process with result_index 1 to 3", "stands_for": "several result lines in one process: stop_reason null, null, end_turn"},
   "task-turn.jsonl": {"origin": "synthetic", "stands_for": "task lane turn: intermediate text plus notify_owner"},
   "granted-merge.jsonl": {"origin": "synthetic", "stands_for": "a guard-allowed gh pr merge (grant use)"},
   "hang.jsonl": {"origin": "synthetic", "stands_for": "turn that never ends (fake-claude sleeps until SIGTERM)"}

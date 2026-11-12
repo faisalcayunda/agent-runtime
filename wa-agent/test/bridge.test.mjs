@@ -1,6 +1,6 @@
 // Bridge core tests (PLAN 2.2, 2.2.1, 2.3, 2.12, 5.2; S3, S4, S7, S12, S16). The Baileys socket is a fake (wa), the
 // runner is either driven by hand or a real runner over a real unix socket with the fake `claude`.
-// Fixtures are SYNTHETIC (test/fixtures/SOURCES.json). Assumed stream-json fields: see runner.test.mjs header and
+// Fixtures: plain, deferred, answered, parallel, guard-deny, multi-result are trimmed real recordings (spike T2, T3, T5, T8, T12); the rest are synthetic (test/fixtures/SOURCES.json). Assumed stream-json fields: see runner.test.mjs header and
 // src/stream.mjs (system/init, result.session_id, stop_reason "tool_deferred", deferred_tool_use, modelUsage,
 // permission_denials, duration_ms, usage).
 import { test } from "node:test";
@@ -469,7 +469,7 @@ test("end to end: message -> turn -> deferred -> poll -> numbered reply -> hook 
   await waitFor(() => b.state.d.queue.length === 1);
   assert.equal(b.wa.polls.length, 1);
   await b.core.onMessage(msg("e2", "1", T0 + 2));
-  await waitFor(() => b.wa.texts.some((t) => t.text === "Oke, pakai React."));
+  await waitFor(() => b.wa.texts.some((t) => t.text === "You chose **blue**."));
   const calls = R.calls();
   assert.deepEqual(calls[1].argv.slice(0, 3), ["-p", "--resume", "sess-1"]);
   assert.equal(b.state.d.sessions.chat, "sess-1");

@@ -273,11 +273,10 @@ test("wiki-retrieve returns the matching page for a prompt, labels a draft, and 
   assert.equal(retrieve(join(S.dir, "no-wiki-here"), "jelaskan Gremio wiki sync flock itu apa"), null); // missing root: silent exit 0
 });
 
-test("the managed settings run wiki-retrieve on UserPromptSubmit, without onFailure block", () => {
-  const h = JSON.parse(readFileSync(join(ROOT, "config", "managed-settings.json"), "utf8")).hooks.UserPromptSubmit;
-  assert.equal(h.length, 1);
-  assert.equal(h[0].hooks[0].command, "python3 /opt/wa-agent/hooks/wiki-retrieve.py");
-  assert.equal(h[0].hooks[0].onFailure, undefined);
+test("the managed settings carry no UserPromptSubmit hook: retrieval runs in the runner (spike T13: the hook skips resumes)", () => {
+  const hooks = JSON.parse(readFileSync(join(ROOT, "config", "managed-settings.json"), "utf8")).hooks;
+  assert.equal(hooks.UserPromptSubmit, undefined);
+  assert.deepEqual(Object.keys(hooks), ["PreToolUse"]);
 });
 
 // ---- follow-ups: deletions, commits that skipped the hook, the read-path refresh ----

@@ -1,5 +1,6 @@
 // Runner tests (PLAN 2.1, 2.2, 2.7, 2.11, 2.12): real runner, real unix socket, fake `claude` replaying fixtures.
-// Fixtures in test/fixtures/*.jsonl are SYNTHETIC (see fixtures/SOURCES.json) until phase 1 records real ones.
+// Fixtures in test/fixtures/*.jsonl: plain, deferred, answered, parallel, guard-deny, multi-result are trimmed REAL recordings
+// (spike results, see fixtures/SOURCES.json); task-turn, granted-merge, hang stay synthetic.
 // stream-json fields assumed (all parsed in src/stream.mjs): system/init {session_id, model}; result.session_id,
 // result.stop_reason ("tool_deferred"), result.deferred_tool_use {id,name,input}, result.modelUsage,
 // result.permission_denials, result.duration_ms, result.usage; assistant message content text/tool_use blocks
@@ -78,13 +79,13 @@ test("defer then answer: the runner streams the deferred question, then the resu
   turn(b, { lane: "chat", prompt: "pilih framework", session: null });
   const r1 = await b.wait((e) => e.ev === "result");
   assert.equal(r1.stopReason, "tool_deferred");
-  assert.equal(r1.deferred.id, "toolu_ask1");
+  assert.equal(r1.deferred.id, "toolu_0171fPoPiDXrhmqhiXbWPEh1"); // recorded id (spike T2)
   assert.equal(r1.deferred.name, "AskUserQuestion");
   assert.equal(r1.sessionId, "sess-1");
   assert.equal(b.of("session")[0].sessionId, "sess-1");
   turn(b, { lane: "chat", prompt: "", session: r1.sessionId });
   await waitFor(() => b.of("result").length === 2);
-  assert.equal(b.of("text")[0].text, "Oke, pakai React.");
+  assert.equal(b.of("text")[0].text, "You chose **blue**.");
   assert.equal(b.of("result")[1].stopReason, "end_turn");
   await R.runner.close();
 });
@@ -105,9 +106,9 @@ test("task-lane intermediate text is not forwarded; chat-lane text is", async ()
   await R.runner.close();
 });
 
-test("at most 2 task lanes run; a third waits and starts when a lane is done", async () => {
+test("with WA_MAX_TASK_LANES=2 at most 2 task lanes run; a third waits and starts when a lane is done", async () => {
   const S = sandbox();
-  const R = await startRunner(S, {});
+  const R = await startRunner(S, { maxTaskLanes: 2 });
   const b = await connect(R.sock, { role: "bridge" });
   assert.equal((await toolCall(R, "chat", "start_task", { issue: "i1" })).status, "started");
   assert.equal((await toolCall(R, "chat", "start_task", { issue: "i2" })).status, "started");

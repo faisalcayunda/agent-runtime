@@ -14,6 +14,11 @@ import { LineSplitter } from "./stream.mjs";
 import { buildArgv, buildEnv } from "./runner.mjs";
 import { resetPolicy } from "./reset.mjs";
 
+// Models used by one turn: modelUsage is cumulative across --resume, model_usage_since_last_result is per turn (spike section 8).
+export const perTurnModels = (result) => Object.keys(result?.model_usage_since_last_result ?? result?.modelUsage ?? {});
+// init.mcp_servers is [{name,status,source}]: only servers that actually connected count.
+export const mcpNames = (init) => (Array.isArray(init?.mcp_servers) ? init.mcp_servers : []).filter((s) => s?.status === "connected").map((s) => String(s.name));
+
 export const MIN_VERSION = [2, 1, 283];
 export const ANTISLOP = ["antislop", "antislop-code", "antislop-copywriting", "antislop-human", "antislop-layoutmobile", "antislop-ui"];
 const isFable = (s) => /fable/i.test(String(s));
@@ -38,7 +43,7 @@ export function digest(lines) {
       }
     } else if (o?.type === "user" && Array.isArray(o.message?.content)) {
       for (const b of o.message.content) if (b.type === "tool_result") d.results.set(b.tool_use_id, { isError: b.is_error === true, content: JSON.stringify(b.content ?? "").slice(0, 300) });
-    } else if (o?.type === "result") d.result = o;
+    } else if (o?.type === "result") { if (!(d.result && d.result.stop_reason != null && o.stop_reason == null)) d.result = o; } // several results per process: keep the last one with a stop_reason
   }
   return d;
 }
@@ -117,7 +122,7 @@ export async function selftest(opts = {}) {
   } finally {
     if (memBefore === null) rmSync(memory, { force: true }); else writeFileSync(memory, memBefore);
   }
-  const r1 = t1.result ?? {}, mu = Object.keys(r1.modelUsage ?? {});
+  const r1 = t1.result ?? {}, mu = perTurnModels(r1);
 
   const bash = t1.toolUses.find((u) => u.name === "Bash" && String(u.input.command ?? "").includes(`gremio-selftest-${nonce}`));
   let logged = false;
@@ -142,7 +147,7 @@ export async function selftest(opts = {}) {
   const plug = spawnSync(bin, ["plugin", "list"], { encoding: "utf8", env });
   const plugText = `${plug.stdout}${plug.stderr}`.trim();
   const noPlugin = plug.status === 0 && (plugText === "" || /no plugins?|none|0 plugins?/i.test(plugText)); // wording UNVERIFIED: the detail shows the raw output
-  const mcp = (t1.init?.mcp_servers ?? []).map((s) => s.name);
+  const mcp = mcpNames(t1.init);
   out.push(step(5, "four assets only, no plugin, owner and context7 MCP", skillsHere.length > 0 && JSON.stringify(skillsHere) === JSON.stringify(skillsWant) && !missing.length && noPlugin && mcp.includes("owner") && mcp.includes("context7"),
     `skills=${skillsHere.length}/${skillsWant.length} missing=[${missing}] plugins="${plugText.slice(0, 60)}" mcp=[${mcp}]`));
 
