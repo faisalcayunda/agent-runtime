@@ -206,7 +206,9 @@ test("ack: the reaction waits 30 s; a reply text cancels it, silence lets it thr
   await b.core.onRunnerEvent(result("chat"));
   await b.core.onMessage(dm("m2", "lagi"));
   assert.equal(armed(), 1);
-  await b.T.fire();                                                // 30 s pass with no reply
+  await b.T.advance(30000);                                        // 30 s pass with no reply: the runner is asked for an emoji
+  assert.deepEqual(b.wa.reacts, []);
+  await b.T.advance(5000);                                         // no answer in 5 s: 👀
   assert.deepEqual(b.wa.reacts, [{ key: KEY("m2") }]);
   await b.core.onRunnerEvent(result("chat"));
   // family group
@@ -221,7 +223,7 @@ test("ack: the reaction waits 30 s; a reply text cancels it, silence lets it thr
   await b.core.onRunnerEvent(result(LF));
   await b.core.onMessage(gmsg("g2", "gremio lagi"));
   assert.equal(armed(), 1);
-  await b.T.fire();
+  await b.T.advance(35000);
   assert.deepEqual(b.wa.reacts.map((r) => [r.jid, r.key.id]), [[FAM, "g2"]]);
 });
 
@@ -430,11 +432,12 @@ test("bridge /status: a running lane shows minutes and its last action; without 
 
 // ---------- 5. generated ack line (owner 2026-11-12): the runner writes it, the bridge falls back to the fixed lines ----------
 
-const askOf = (b) => b.sent.filter((m) => m.op === "ack-text").at(-1);
+const askOf = (b) => b.sent.filter((m) => m.op === "ack-text" && !m.kind).at(-1);       // the progress line
+const reactAskOf = (b) => b.sent.filter((m) => m.op === "ack-text" && m.kind === "react").at(-1);   // the reaction emoji
 const askAt60 = async (b) => { await b.T.advance(60000); return askOf(b); };
 const FIXED = (b) => ACKS.includes(b.wa.texts.at(-1)?.text);
 
-test("ack timing: the 👀 comes at 30 s and not before; the runner is asked at 60 s and not before", async () => {
+test("ack timing: the reaction is decided at 30 s (👀 when the emoji does not come within 5 s) and not before; the runner is asked for the line at 60 s and not before", async () => {
   const b = mk(sandbox(), { reactMs: null });
   await up(b);
   await b.core.onMessage(dm("m1", "tolong cek deploy"));
@@ -442,12 +445,14 @@ test("ack timing: the 👀 comes at 30 s and not before; the runner is asked at 
   await b.T.advance(29999);
   assert.deepEqual(b.wa.reacts, []);
   await b.T.advance(1);
+  assert.deepEqual(b.wa.reacts, []);                               // asked the runner, waiting for the emoji
+  await b.T.advance(5000);
   assert.deepEqual(b.wa.reacts, [{ key: KEY("m1") }]);
-  await b.T.advance(29999);                                        // 59.999 s
+  await b.T.advance(24999);                                        // 59.999 s
   assert.equal(askOf(b), undefined);
   await b.T.advance(1);                                            // 60 s
   assert.deepEqual([askOf(b).lane, askOf(b).text], ["chat", "tolong cek deploy"]);
-  assert.equal(b.sent.filter((m) => m.op === "ack-text").length, 1);
+  assert.equal(b.sent.filter((m) => m.op === "ack-text" && !m.kind).length, 1);
 });
 
 test("ack text: the generated line is sent when the runner answers in time; quotes are stripped; the 8 s wait is dropped", async () => {
@@ -697,6 +702,158 @@ test("ack text end to end: bridge core, real runner, fake router: the generated 
     await waitFor(() => b.wa.texts.length === 1);
     if (ok) assert.deepEqual(b.wa.texts.map((x) => x.text), ["Lagi aku cek deploy-nya."]);
     else assert.ok(ACKS.includes(b.wa.texts[0].text));
+    assert.equal(router.reqs.length, 1);
+    conn.send({ op: "stop" });
+    await conn.wait((e) => e.ev === "result");
+  }
+});
+
+// ---------- 6. reaction emoji (owner 2026-11-12): at 30 s the runner picks one allowlisted emoji for the message, 👀 otherwise ----------
+
+const answerEmoji = (b, text, over = {}) => b.core.onRunnerEvent({ ev: "ack-text", id: reactAskOf(b).id, text, ...over });
+const emojiBridge = async (extra) => { const b = mk(sandbox(), { reactMs: null, ...extra }); await up(b); return b; };
+
+test("react emoji: at 30 s the runner is asked for the message (300 chars, kind react); the allowlisted answer is the reaction, ❤ without the selector is normalized", async () => {
+  const b = await emojiBridge();
+  await b.core.onMessage(dm("m1", "k".repeat(900)));
+  await b.T.advance(29999);
+  assert.equal(reactAskOf(b), undefined);                          // not before 30 s
+  await b.T.advance(1);
+  const q = reactAskOf(b);
+  assert.deepEqual([q.op, q.kind, q.lane, q.text.length], ["ack-text", "react", "chat", 300]);
+  assert.deepEqual(b.wa.reacts, []);                               // waits for the answer
+  await answerEmoji(b, " \u{1F6E0}\uFE0F\n");
+  assert.deepEqual(b.wa.reacts, [{ key: KEY("m1"), emoji: "\u{1F6E0}\uFE0F" }]);
+  await b.T.advance(5000);                                         // the wait timer was dropped: nothing more
+  assert.equal(b.wa.reacts.length, 1);
+  await b.core.onRunnerEvent(result("chat"));
+  await b.core.onMessage(dm("m2", "makasih ya"));
+  await b.T.advance(30000);
+  await answerEmoji(b, "\u2764");
+  assert.deepEqual(b.wa.reacts.at(-1), { key: KEY("m2"), emoji: "\u2764\uFE0F" });
+});
+
+test("react emoji: an answer off the allowlist, or an unusable one, gives 👀", async () => {
+  for (const bad of ["\u{1F984}", "\u{1F440}\u{1F440}", "\u{1F440} oke", "oke", "", "\u{1F6E0}\u{1F6E0}", "👍🏽", 7, undefined, null]) {
+    const b = await emojiBridge();
+    await b.core.onMessage(dm("m1", "tolong cek"));
+    await b.T.advance(30000);
+    await answerEmoji(b, bad);
+    assert.deepEqual(b.wa.reacts, [{ key: KEY("m1") }], String(bad));       // no emoji: wa.react sends its default 👀
+  }
+});
+
+test("react emoji: no answer in 5 s gives 👀 and a late answer changes nothing; a runner that is down is not asked", async () => {
+  const b = await emojiBridge();
+  await b.core.onMessage(dm("m1", "tolong cek"));
+  await b.T.advance(34999);
+  assert.deepEqual(b.wa.reacts, []);
+  await b.T.advance(1);
+  assert.deepEqual(b.wa.reacts, [{ key: KEY("m1") }]);
+  await answerEmoji(b, "\u{1F525}");
+  assert.equal(b.wa.reacts.length, 1);
+  const d = mk(sandbox(), { reactMs: null });                      // never said hello: the runner is down
+  await d.core.onOpen();
+  await d.core.onMessage(dm("m1", "tolong cek"));
+  await d.T.advance(30000);
+  assert.equal(reactAskOf(d), undefined);
+  assert.deepEqual(d.wa.reacts, [{ key: KEY("m1") }]);
+});
+
+test("react emoji: a reply before 30 s cancels the reaction with no router call; a reply while the emoji is awaited cancels it too", async () => {
+  const b = await emojiBridge();
+  await b.core.onMessage(dm("m1", "cek"));
+  await b.core.onRunnerEvent({ ev: "text", lane: "chat", text: "sudah", key: "k1" });
+  await b.T.advance(40000);
+  assert.deepEqual([reactAskOf(b), b.wa.reacts], [undefined, []]);
+  await b.core.onRunnerEvent(result("chat"));
+  await b.core.onMessage(dm("m2", "lagi"));
+  await b.T.advance(30000);
+  assert.ok(reactAskOf(b));
+  await b.core.onRunnerEvent({ ev: "text", lane: "chat", text: "nih", key: "k2" });
+  await answerEmoji(b, "\u{1F44D}");
+  await b.T.advance(5000);
+  assert.deepEqual(b.wa.reacts, []);
+});
+
+test("react emoji, group: the emoji goes to the message's own group JID", async () => {
+  const b = await emojiBridge();
+  await b.core.onMessage(gmsg("g1", "gremio resep nasi goreng?"));
+  await b.T.advance(30000);
+  const q = reactAskOf(b);
+  assert.deepEqual([q.lane, q.kind], [LF, "react"]);
+  assert.match(q.text, /resep nasi goreng/);
+  await answerEmoji(b, "\u{1F64F}");
+  assert.deepEqual(b.wa.reacts.map((r) => [r.jid, r.key.id, r.emoji]), [[FAM, "g1", "\u{1F64F}"]]);
+  await b.core.onRunnerEvent(result(LF));
+  await b.core.onMessage(gmsg("g2", "gremio lagi"));
+  await b.T.advance(35000);                                        // no answer: 👀 in the group
+  assert.deepEqual(b.wa.reacts.at(-1), { key: b.wa.reacts.at(-1).key, jid: FAM });
+  assert.equal(b.wa.reacts.at(-1).key.id, "g2");
+  assert.equal(b.wa.texts.length, 0);
+});
+
+test("runner react emoji: one POST, 10 tokens, the allowlist in the prompt, 300 chars of the message, no memory or last action; allowlisted answer returned", async (t) => {
+  const router = await fakeRouter(t, says("\u{1F6E0}\uFE0F"));
+  const { S, R, ask } = await runnerWithTurn(t, { ANTHROPIC_BASE_URL: router.url, ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite", HTTPS_PROXY: "http://127.0.0.1:1", HTTP_PROXY: "http://127.0.0.1:1", NO_PROXY: "" });
+  writeFileSync(join(S.home, ".claude", "agent-memory", "MEMORY.md"), "RAHASIA-MEMORI-OWNER\n");
+  writeFileSync(join(S.home, ".claude", "guard.log"), JSON.stringify({ decision: "pass", tool: "Bash", subject: "kubectl get pods", session_id: "S-9", lane: "chat" }) + "\n");
+  const r = await ask({ kind: "react", text: "benerin <b>bug</b> " + "x".repeat(400) });
+  assert.equal(r.text, "\u{1F6E0}\uFE0F");
+  assert.equal(router.reqs.length, 1);
+  const q = router.reqs[0];
+  assert.deepEqual([q.method, q.url, q.headers.authorization], ["POST", "/v1/messages", `Bearer ${TOKEN}`]);
+  const body = JSON.parse(q.body);
+  assert.deepEqual([body.model, body.max_tokens], ["role-exec-lite", 10]);
+  for (const e of ["\u{1F440}", "\u{1F6E0}\uFE0F", "\u{1FAE1}"]) assert.ok(body.system.includes(e), e);
+  const user = body.messages[0].content;
+  assert.match(user, /benerin/);
+  assert.equal(user.replace(/<\/?pesan>/g, "").trim().length, 300);
+  assert.doesNotMatch(q.body, /RAHASIA|kubectl|<b>/);
+  assert.equal(q.body.includes(TOKEN), false);
+  assert.equal(R.logs.join("\n").includes(TOKEN), false);
+});
+
+test("runner react emoji: a non-allowlisted answer, HTTP errors, a hung router, bad JSON, no router and a lane that is not running all answer null", async (t) => {
+  for (const [name, handler, opts] of [
+    ["off the allowlist", says("\u{1F984}"), {}],
+    ["text", says("keren banget"), {}],
+    ["500", (req, res) => { res.statusCode = 500; res.end("boom"); }, {}],
+    ["401 echoing the credential", (req, res) => { res.statusCode = 401; res.end(`bad key ${req.headers.authorization}`); }, {}],
+    ["not json", (req, res) => res.end("<html>"), {}],
+    ["hung", () => {}, { reactHttpMs: 150 }],
+  ]) {
+    const router = await fakeRouter(t, handler);
+    const x = await runnerWithTurn(t, { ANTHROPIC_BASE_URL: router.url, ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite" }, opts);
+    assert.equal((await x.ask({ kind: "react", text: "cek" })).text, null, name);
+    assert.equal(router.reqs.length, 1, name);
+    assert.equal(x.R.logs.join("\n").includes(TOKEN), false, `${name}: the credential reached the runner log`);
+    assert.ok(x.R.logs.some((l) => l.startsWith("react emoji: ")), name);
+  }
+  const router = await fakeRouter(t, says("\u{1F44D}"));
+  const x = await runnerWithTurn(t, { ANTHROPIC_BASE_URL: router.url, ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite" });
+  assert.equal((await x.ask({ kind: "react", lane: "nope" })).text, null);
+  assert.equal(router.reqs.length, 0);
+  const none = await runnerWithTurn(t, { ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite" });   // direct route: no router URL
+  assert.equal((await none.ask({ kind: "react", text: "cek" })).text, null);
+});
+
+test("react emoji end to end: bridge core, real runner, fake router: the generated emoji is the reaction; a router failure gives 👀", async (t) => {
+  for (const ok of [true, false]) {
+    const router = await fakeRouter(t, ok ? says("\u{1F525}") : (req, res) => { res.statusCode = 503; res.end("{}"); });
+    const S = sandbox();
+    const R = await startRunner(S, { script: ["hang"], env: { ANTHROPIC_BASE_URL: router.url, ANTHROPIC_AUTH_TOKEN: TOKEN, ANTHROPIC_DEFAULT_HAIKU_MODEL: "role-exec-lite" } });
+    const conn = await connect(R.sock, { role: "bridge" });
+    const b = mk(S);
+    const core = createCore({ state: openState(join(S.dir, "bridge2", "state.json")), xchg: S.xchg, wa: b.wa, setTimer: b.T.setTimer, clearTimer: b.T.clearTimer, toRunner: (m) => conn.send(m), now: () => (b.clock.t += 1000) });
+    attach(conn.socket, (ev) => { if (ev.ev === "ack-text") core.onRunnerEvent(ev); });
+    await core.onOpen();
+    await core.onRunnerEvent({ ev: "hello", busy: [] });
+    await core.onMessage(dm("m1", "tolong cek deploy"));
+    await conn.wait((e) => e.ev === "session");
+    await b.T.advance(30000);
+    await waitFor(() => b.wa.reacts.length === 1);
+    assert.deepEqual(b.wa.reacts, ok ? [{ key: KEY("m1"), emoji: "\u{1F525}" }] : [{ key: KEY("m1") }]);
     assert.equal(router.reqs.length, 1);
     conn.send({ op: "stop" });
     await conn.wait((e) => e.ev === "result");

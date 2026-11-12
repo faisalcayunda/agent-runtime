@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { safeWrite } from "./state.mjs";
+import { REACT_EMOJIS } from "./ack.mjs";
 
 // ---------- owner gate ----------
 const bare = (jid) => String(jid ?? "").replace(/:\d+(?=@)/, ""); // drop the device suffix
@@ -300,10 +301,12 @@ export function createWa({ lib, owners, groups = new Set(), ownerJid, authDir, x
     sendGroup: (jid, text, { id, quote } = {}) => (GROUP_JID.test(String(jid)) ? withRetry(() => sock.sendMessage(jid, { text }, { ...(id ? { messageId: id } : {}), ...(quote ? { quoted: quote } : {}) })) : Promise.reject(new Error("not a group JID"))),
     // Reaction to a message the bridge is about to work on: the owner's DM (no jid) or a group message (the group JID, which must
     // be the message's own chat). Same destinations as every other send; best effort, the caller does not wait on it.
-    react: (key, { jid } = {}) => {
+    // `emoji` must be on the REACT_EMOJIS allowlist, else the default 👀 goes out.
+    react: (key, { jid, emoji } = {}) => {
       if (!key?.id) return Promise.resolve();
-      if (jid === undefined) return withRetry(() => sock.sendMessage(to, { react: { text: ACK_EMOJI, key } }));
-      return GROUP_JID.test(String(jid)) && key.remoteJid === jid ? withRetry(() => sock.sendMessage(jid, { react: { text: ACK_EMOJI, key } })) : Promise.reject(new Error("not a group JID"));
+      const text = REACT_EMOJIS.includes(emoji) ? emoji : ACK_EMOJI;
+      if (jid === undefined) return withRetry(() => sock.sendMessage(to, { react: { text, key } }));
+      return GROUP_JID.test(String(jid)) && key.remoteJid === jid ? withRetry(() => sock.sendMessage(jid, { react: { text, key } })) : Promise.reject(new Error("not a group JID"));
     },
     // Returns {id, raw}: the poll creation message, JSON-encoded for state.json (messageSecret included).
     sendPoll: (name, values, { id, multi = false } = {}) => withRetry(async () => {

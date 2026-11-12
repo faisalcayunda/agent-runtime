@@ -20,7 +20,7 @@ import { attach, send } from "./ipc.mjs";
 import { MEDIA_CAPS, messageId } from "./wa.mjs";
 import { createHealth, httpGet } from "./health.mjs";
 import { groupLaneId, inside, isGroupLane, validFile, validId } from "./ids.mjs";
-import { ACK_TRIGGER_MAX, cleanAck } from "./ack.mjs";
+import { ACK_TRIGGER_MAX, REACT_TRIGGER_MAX, cleanAck, cleanEmoji } from "./ack.mjs";
 
 const MAX_TEXT = 4000; // WhatsApp message length we split at (UNVERIFIED limit, PLAN 2.2 step 4)
 const POLL_MAX_OPTIONS = 12;
@@ -32,6 +32,7 @@ const POLL_UNREADABLE = "poll-nya gak kebaca, jawab pakai angka aja ya";
 const ACK_MS = 60000;
 const REACT_MS = 30000;
 const ACK_TEXT_MS = 8000;
+const REACT_EMOJI_MS = 5000; // the 👀 at 30 s becomes an emoji that fits the message when the runner answers within this; else 👀
 const ACK_LINES = ["Oke, lagi aku kerjain ya.", "Siap, bentar ya, lagi aku cek.", "Sip, aku proses dulu ya.", "Oke, bentar ya, lagi aku urus."];
 const ackLine = (msgId) => ACK_LINES[parseInt(messageId(`ack-line:${msgId}`).slice(2, 6), 16) % ACK_LINES.length];
 const mb = (kind) => MEDIA_CAPS[kind] / 1024 / 1024;
@@ -85,7 +86,7 @@ export function renderQuestion(head, { group = false } = {}) {
   return `${n}${q.question}${list ? "\n" + list : ""}${how}`;
 }
 
-export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, log = () => {}, setTimer = (f, ms) => { const t = setTimeout(f, ms); t.unref(); return t; }, clearTimer = clearTimeout, ackMs = ACK_MS, reactMs = REACT_MS, ackTextMs = ACK_TEXT_MS, statusMs = 2000 }) {
+export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, log = () => {}, setTimer = (f, ms) => { const t = setTimeout(f, ms); t.unref(); return t; }, clearTimer = clearTimeout, ackMs = ACK_MS, reactMs = REACT_MS, ackTextMs = ACK_TEXT_MS, reactEmojiMs = REACT_EMOJI_MS, statusMs = 2000 }) {
   const S = state.d;
   const save = () => state.save();
   const known = (id) => id === "chat" || (validId(id) && !!S.lanes[id]);
@@ -164,17 +165,18 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   // Asked of the runner outside the serial chain, like /status: waiting here must not hold back the "text" event that cancels the ack.
   const ackWait = new Map(); // request id -> resolve
   let ackSeq = 0;
-  function askAckText(id, trigger) {
+  // Resolves the runner's raw answer, or null after waitMs; the caller checks it again (cleanAck, cleanEmoji): it goes to WhatsApp from this process.
+  function askRunner(id, trigger, waitMs, kind) {
     const rid = `ak${++ackSeq}`;
     return new Promise((res) => {
-      const t = setTimer(() => { ackWait.delete(rid); res(null); }, ackTextMs);
+      const t = setTimer(() => { ackWait.delete(rid); res(null); }, waitMs);
       ackWait.set(rid, (text) => { clearTimer(t); res(text); });
-      toRunner({ op: "ack-text", id: rid, lane: id, text: trigger });
+      toRunner({ op: "ack-text", id: rid, lane: id, text: trigger, ...(kind ? { kind } : {}) });
     });
   }
   function onAckTextReply(m) {
     const done = ackWait.get(String(m.id));
-    if (done) { ackWait.delete(String(m.id)); done(cleanAck(m.text)); } // the line is checked again here: it goes to WhatsApp from this process
+    if (done) { ackWait.delete(String(m.id)); done(m.text); }
   }
   // The check and the send share one turn of the chain: a reply text handled before it has already cancelled the ack.
   const sendAck = serial(async (id, a, text) => {
@@ -186,7 +188,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   });
   async function fireAck(id, a) {
     if (acks.get(id) !== a) return;
-    const text = runnerUp && S.lanes[id]?.inflight ? await askAckText(id, a.trigger) : null;
+    const text = runnerUp && S.lanes[id]?.inflight ? cleanAck(await askRunner(id, a.trigger, ackTextMs)) : null;
     return sendAck(id, a, text);
   }
   function startAck(id, msgId, trigger = "") {
@@ -196,12 +198,27 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     a.timer = setTimer(() => { fireAck(id, a).catch((e) => log(`ack failed: ${e.message}`)); }, ackMs);
     acks.set(id, a);
   }
-  // The 👀 waits reactMs (owner 2026-11-12): a quick reply makes it unnecessary, so any reply text on the lane cancels it.
-  const reacts = new Map(); // lane -> timer
-  const cancelReact = (id) => { const t = reacts.get(id); if (t) { clearTimer(t); reacts.delete(id); } };
-  const deferReact = (id, key, group) => { cancelReact(id); if (key && reactMs <= 0) return react(key, group); if (key) reacts.set(id, setTimer(() => { reacts.delete(id); react(key, group); }, reactMs)); };
+  // The reaction waits reactMs (owner 2026-11-12): a quick reply makes it unnecessary, so any reply text or result on the lane
+  // cancels it, also while the runner is being asked for the emoji. The emoji fits the message (the runner asks the small model,
+  // reactEmojiMs at most); no answer in time, a failure or an emoji off the allowlist gives 👀.
+  const reacts = new Map(); // lane -> {timer, dead}
+  const cancelReact = (id) => { const r = reacts.get(id); if (r) { clearTimer(r.timer); r.dead = true; reacts.delete(id); } };
+  async function fireReact(id, r, key, group, trigger) {
+    const raw = runnerUp && S.lanes[id]?.inflight ? await askRunner(id, trigger, reactEmojiMs, "react") : null;
+    if (r.dead) return;
+    reacts.delete(id);
+    react(key, group, cleanEmoji(raw));
+  }
+  const deferReact = (id, key, group, text = "") => {
+    cancelReact(id);
+    if (!key) return;
+    if (reactMs <= 0) return react(key, group);
+    const r = { timer: null, dead: false };
+    r.timer = setTimer(() => { fireReact(id, r, key, group, String(text).slice(0, REACT_TRIGGER_MAX)).catch((e) => log(`reaction failed: ${e.message}`)); }, reactMs);
+    reacts.set(id, r);
+  };
   // Best effort and never awaited: a reaction must not hold the serial chain while the socket is down.
-  const react = (key, group) => { if (key) Promise.resolve(group ? wa.react?.(key, { jid: group }) : wa.react?.(key)).catch((e) => log(`reaction failed: ${e.message}`)); };
+  const react = (key, group, emoji) => { if (key) Promise.resolve(wa.react?.(key, { ...(group ? { jid: group } : {}), ...(emoji ? { emoji } : {}) })).catch((e) => log(`reaction failed: ${e.message}`)); };
 
   // ---- questions ----
   async function showHead() {
@@ -321,7 +338,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     const pre = preOf(n.quoted);
     lane(id).queue.push({ text: `[${labelOf(g)}] ${pre ? pre + "\n" : ""}${text}`, id: n.id, quote: g.quote, fromOwner: g.fromOwner === true, ack: true, ...(videos.length ? { videos } : {}) });
     save();
-    if (laneDest(id)) deferReact(id, g.quote?.key, g.jid);
+    if (laneDest(id)) deferReact(id, g.quote?.key, g.jid, text);
     return pump(id);
   }
 
@@ -352,7 +369,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       return enqueue(rec.lane, text, msgId);
     }
     if (S.queue[0]) return answerHead(parseAnswerFor(S.queue[0], text), text); // (2) the head question
-    deferReact("chat", key);
+    deferReact("chat", key, undefined, text);
     return enqueue("chat", text, msgId, { ...(pre ? { pre } : {}), ...(videos.length ? { videos } : {}), ack: true }); // (3) the chat lane
   }
   const parseAnswerFor = (head, text) => (head.kind === "ask-owner" ? text : parseAnswer(head.questions[head.cursor], text));

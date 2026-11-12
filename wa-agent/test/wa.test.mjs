@@ -424,3 +424,14 @@ test("react: the owner's DM goes to the owner, a group message to its own group;
   assert.deepEqual(sends.map((x) => [x.jid, x.content.react.text, x.content.react.key.id]), [[OWNER, ACK_EMOJI, "M1"], [FAM, ACK_EMOJI, "M2"]]);
   assert.equal(ACK_EMOJI, "\u{1F440}");
 });
+
+test("react: an allowlisted emoji is sent as given (DM and group); anything else goes out as 👀", async () => {
+  const S = sandbox();
+  const { F, wa } = await startWa(S);
+  await wa.react({ id: "M1", remoteJid: "555@lid", fromMe: false }, { emoji: "\u{1F6E0}\uFE0F" });
+  await wa.react({ id: "M2", remoteJid: FAM, participant: MEMBER }, { jid: FAM, emoji: "\u2764\uFE0F" });
+  await wa.react({ id: "M3", remoteJid: "555@lid", fromMe: false }, { emoji: "\u{1F984}" });
+  await wa.react({ id: "M4", remoteJid: FAM, participant: MEMBER }, { jid: FAM, emoji: "x" });
+  const sends = F.sent.filter((x) => x.content?.react);
+  assert.deepEqual(sends.map((x) => [x.jid, x.content.react.text]), [[OWNER, "\u{1F6E0}\uFE0F"], [FAM, "\u2764\uFE0F"], [OWNER, ACK_EMOJI], [FAM, ACK_EMOJI]]);
+});

@@ -15,7 +15,7 @@ import { LineSplitter, parseLine, pickResult } from "./stream.mjs";
 import { attach, send } from "./ipc.mjs";
 import { resetPolicy } from "./reset.mjs";
 import { inside, isGroupLane, validFile, validId } from "./ids.mjs";
-import { ACK_TRIGGER_MAX, generateAck } from "./ack.mjs";
+import { ACK_TRIGGER_MAX, REACT_TRIGGER_MAX, generateAck, generateReactEmoji } from "./ack.mjs";
 
 const CODE_RE = /^[a-z0-9]{3,8}-[0-9]{3,6}$/i;
 
@@ -498,6 +498,10 @@ export function createRunner(opts) {
         const id = String(m.id ?? "").slice(0, 64), e = typeof m.lane === "string" ? lanes.get(m.lane) : null;
         if (!e) return send(sock, { ev: "ack-text", id, text: null });
         // Only this request's own message and this lane's own last action: nothing from memory or another lane.
+        if (m.kind === "react") { // the reaction emoji (answered in the same event, `text`): one allowlisted emoji or null, the bridge reacts 👀 on null
+          return void generateReactEmoji({ baseUrl: srcEnv.ANTHROPIC_BASE_URL, ...ackCred, model: ackModel, trigger: typeof m.text === "string" ? m.text.slice(0, REACT_TRIGGER_MAX) : "", timeoutMs: opts.reactHttpMs ?? opts.ackHttpMs, failed: (why) => log(`react emoji: ${why}`) })
+            .then((text) => send(sock, { ev: "ack-text", id, text }));
+        }
         return void generateAck({ baseUrl: srcEnv.ANTHROPIC_BASE_URL, ...ackCred, model: ackModel, trigger: typeof m.text === "string" ? m.text.slice(0, ACK_TRIGGER_MAX) : "", last: lastAction(e.sessionId), timeoutMs: opts.ackHttpMs, failed: (why) => log(`ack text: ${why}`) })
           .then((text) => send(sock, { ev: "ack-text", id, text }));
       }
