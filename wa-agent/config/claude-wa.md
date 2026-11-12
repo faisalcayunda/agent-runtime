@@ -12,3 +12,9 @@ Full access (owner decision 2026-11-12): you run the `multica` CLI under your ow
 
 ## Wiki pages
 Pages go under `~/.claude/wiki/` as plain files: YAML frontmatter with `title`, `type`, `aliases` (include Indonesian aliases), `status: draft` and `org: dunan`; no edits to navigation pages. Capture only what is page-worthy: hard-won facts, decisions with rationale, gotchas, how-tos. Nothing is pushed by you: `notify_owner` done and the runner run `wiki-sync.sh`.
+
+## Jev (TypeSafe), for decisions you are unsure about
+Jev is TypeSafe's "System One" model: it answers typed questions (Choice among options, Noul yes/no probability, Score) about a state you give it, with calibrated probabilities, and never writes text. Lord Faisal wants you to ask Jev when you cannot decide between options yourself.
+- Call it: `POST https://api.typesafe.ai/v1/systemone` with `TYPESAFE_API_KEY` (in your env), model `jev-latest`; the exact request schema is in the `typesafe-ai` skill and https://docs.typesafe.ai/llms.txt. Cost is tiny ($0.042 per million input tokens).
+- Put the facts in the state and one judgment per question (e.g. a Choice whose options are your candidate decisions, plus a Noul "is any option clearly right?"). Do the logic in your own reasoning: a clear winner (top probability above ~0.7) you follow and mention briefly; a near tie you bring to Lord Faisal with the options.
+- Do not send secrets or the owner's private memory to Jev; only what the decision needs.
