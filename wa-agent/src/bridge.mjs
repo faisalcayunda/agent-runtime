@@ -26,6 +26,7 @@ const CODE_TTL_MS = 24 * 3600 * 1000;
 const POLL_UNREADABLE = "poll-nya gak kebaca, jawab pakai angka aja ya";
 // Acknowledge work (owner decision 2026-11-12): a reaction at once, and one short line when a turn has said nothing for ACK_MS.
 const ACK_MS = 15000;
+const REACT_MS = 5000; // the 👀 shows only when no reply came within 5 s
 const ACK_LINES = ["Oke, lagi aku kerjain ya.", "Siap, bentar ya, lagi aku cek.", "Sip, aku proses dulu ya.", "Oke, bentar ya, lagi aku urus."];
 const ackLine = (msgId) => ACK_LINES[parseInt(messageId(`ack-line:${msgId}`).slice(2, 6), 16) % ACK_LINES.length];
 const mb = (kind) => MEDIA_CAPS[kind] / 1024 / 1024;
@@ -79,7 +80,7 @@ export function renderQuestion(head, { group = false } = {}) {
   return `${n}${q.question}${list ? "\n" + list : ""}${how}`;
 }
 
-export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, log = () => {}, setTimer = (f, ms) => { const t = setTimeout(f, ms); t.unref(); return t; }, clearTimer = clearTimeout, ackMs = ACK_MS, statusMs = 2000 }) {
+export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, log = () => {}, setTimer = (f, ms) => { const t = setTimeout(f, ms); t.unref(); return t; }, clearTimer = clearTimeout, ackMs = ACK_MS, reactMs = REACT_MS, statusMs = 2000 }) {
   const S = state.d;
   const save = () => state.save();
   const known = (id) => id === "chat" || (validId(id) && !!S.lanes[id]);
@@ -168,6 +169,10 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     a.timer = setTimer(() => fireAck(id, a).catch((e) => log(`ack failed: ${e.message}`)), ackMs);
     acks.set(id, a);
   }
+  // The 👀 waits reactMs (owner 2026-11-12): a quick reply makes it unnecessary, so any reply text on the lane cancels it.
+  const reacts = new Map(); // lane -> timer
+  const cancelReact = (id) => { const t = reacts.get(id); if (t) { clearTimer(t); reacts.delete(id); } };
+  const deferReact = (id, key, group) => { cancelReact(id); if (key && reactMs <= 0) return react(key, group); if (key) reacts.set(id, setTimer(() => { reacts.delete(id); react(key, group); }, reactMs)); };
   // Best effort and never awaited: a reaction must not hold the serial chain while the socket is down.
   const react = (key, group) => { if (key) Promise.resolve(group ? wa.react?.(key, { jid: group }) : wa.react?.(key)).catch((e) => log(`reaction failed: ${e.message}`)); };
 
@@ -289,7 +294,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     const pre = preOf(n.quoted);
     lane(id).queue.push({ text: `[${labelOf(g)}] ${pre ? pre + "\n" : ""}${text}`, id: n.id, quote: g.quote, fromOwner: g.fromOwner === true, ack: true, ...(videos.length ? { videos } : {}) });
     save();
-    if (laneDest(id)) react(g.quote?.key, g.jid);
+    if (laneDest(id)) deferReact(id, g.quote?.key, g.jid);
     return pump(id);
   }
 
@@ -320,7 +325,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       return enqueue(rec.lane, text, msgId);
     }
     if (S.queue[0]) return answerHead(parseAnswerFor(S.queue[0], text), text); // (2) the head question
-    react(key);
+    deferReact("chat", key);
     return enqueue("chat", text, msgId, { ...(pre ? { pre } : {}), ...(videos.length ? { videos } : {}), ack: true }); // (3) the chat lane
   }
   const parseAnswerFor = (head, text) => (head.kind === "ask-owner" ? text : parseAnswer(head.questions[head.cursor], text));
@@ -456,7 +461,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       case "session": { const L = lane(m.lane); if (!L.fresh && validSession(m.sessionId)) { S.sessions[m.lane] = m.sessionId; save(); } return; }
       case "text": { // a task lane's text is never sent; a group lane's goes to its own group
         if (typeof m.key !== "string" || m.key.length > 200) return;
-        if (String(m.text ?? "").trim()) cancelAck(m.lane);
+        if (String(m.text ?? "").trim()) { cancelAck(m.lane); cancelReact(m.lane); }
         if (m.lane === "chat") return sendOnce(`t:${m.key}`, String(m.text ?? ""));
         const to = laneDest(m.lane);
         if (to) return sendOnce(`t:${m.key}`, String(m.text ?? ""), to);
@@ -488,7 +493,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   async function onResult(m) {
     const L = lane(m.lane);
     const answered = L.inflight?.answered ?? null;
-    cancelAck(m.lane);
+    cancelAck(m.lane); cancelReact(m.lane);
     // The runner has its frames by now and cannot delete from the bridge-owned inbox: the video goes with the turn.
     for (const v of L.inflight?.videos ?? []) { try { unlinkSync(inside(join(xchg, "inbox"), v.name)); } catch { /* gone */ } }
     L.inflight = null;

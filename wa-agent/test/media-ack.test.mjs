@@ -34,10 +34,10 @@ function fakeTimers() {
     async fire() { for (const t of list.filter((x) => !x.off)) { t.off = true; await t.f(); } },
   };
 }
-function mk(S, { groups = new Set([FAM]), statusMs = 30 } = {}) {
+function mk(S, { groups = new Set([FAM]), statusMs = 30, reactMs = 0 } = {}) {
   const wa = fakeWa(), sent = [], T = fakeTimers(), clock = { t: 1_800_000_000_000 };
   const state = openState(join(S.dir, "bridge", "state.json"));
-  const core = createCore({ state, xchg: S.xchg, wa, groups, statusMs, setTimer: T.setTimer, clearTimer: T.clearTimer, toRunner: (m) => sent.push(m), now: () => (clock.t += 1000) });
+  const core = createCore({ state, xchg: S.xchg, wa, groups, statusMs, setTimer: T.setTimer, clearTimer: T.clearTimer, reactMs, toRunner: (m) => sent.push(m), now: () => (clock.t += 1000) });
   return { core, wa, sent, state, T, clock, turns: () => sent.filter((m) => m.op === "turn") };
 }
 const up = async (b) => { await b.core.onOpen(); await b.core.onRunnerEvent({ ev: "hello", busy: [] }); };
