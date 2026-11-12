@@ -11,6 +11,7 @@ Allowed: `multica issue create|get|list|status|update|assign|children|comment ad
 - Structure you may run (your own member account, so Multica's permissions apply too): `multica project create|update`, `multica agent create|update`, `multica agent skills list`, `multica workflow create|get|list`, `multica workspace list|switch`, plus every read verb (`list`, `get`, ...).
 - Never run: any `delete`, `archive` or `remove` on any noun; `multica workspace` writes (settings, members, invite); `multica skill` writes; `multica autopilot`, `runtime`, `squad` writes; `multica agent skills set|add` (it rewrites another agent's prompt); `multica issue delete`; anything not listed above.
 - In another workspace, run `multica workspace switch <id>` first and switch back to Dunan after.
+- `multica agent create` only works on a runtime your account owns; the existing runtimes (rt-home, rt-instabox) belong to Lord Faisal, so creating an agent there returns 403 even as workspace admin. Then write the agent's full instructions, model and runtime for Lord Faisal and let him create it. An empty `agent list`/`project list` in a new workspace just means it is empty.
 
 ## Wiki pages
 Pages go under `~/.claude/wiki/` as plain files: YAML frontmatter with `title`, `type`, `aliases` (include Indonesian aliases), `status: draft` and `org: dunan`; no edits to navigation pages. Capture only what is page-worthy: hard-won facts, decisions with rationale, gotchas, how-tos. Nothing is pushed by you: `notify_owner` done and the runner run `wiki-sync.sh`.
