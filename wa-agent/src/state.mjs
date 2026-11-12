@@ -30,10 +30,13 @@ const fresh = () => ({
   groups: {},                // group lane (grp_<digits>) -> {jid, family}: the only place a group destination is stored (PLAN 2.13)
   gq: {},                    // group lane -> its own question queue (never the owner's)
   usage: {},                 // yyyy-mm-dd -> {turns, input, output, cache_read, cache_creation}
+  refs: {},                  // lane -> {items: [{ref, id, chat, from, mine, ...}], people: {jid: name}}: the messages a lane may act on (PLAN 2.14)
+  xpolls: {},                // poll message id -> {raw, lane, ref, question, options, own, votes, ts}: polls whose votes are tallied (others' and model-made)
+  notes: {},                 // lane -> [{k, ...}]: reactions, vote tallies and polls seen since the lane's last turn (PLAN 2.14)
 });
 
-const MAPS = ["sessions", "lanes", "polls", "inbox", "outbox", "codes", "grants", "grantsUsed", "tasks", "groups", "gq", "usage"];
-const LIMITS = { inbox: 2000, outbox: 2000, polls: 200, grantsUsed: 500, codes: 200 };
+const MAPS = ["sessions", "lanes", "polls", "inbox", "outbox", "codes", "grants", "grantsUsed", "tasks", "groups", "gq", "usage", "refs", "xpolls", "notes"];
+const LIMITS = { inbox: 2000, outbox: 2000, polls: 200, xpolls: 100, grantsUsed: 500, codes: 200 };
 
 export function openState(path) {
   let d;

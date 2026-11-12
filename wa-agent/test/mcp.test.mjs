@@ -28,12 +28,12 @@ async function mcp(S, R, lane, task) {
   return { c, call, text };
 }
 
-test("the owner server lists its six tools", async () => {
+test("the owner server lists its six tools and the seven WhatsApp tools", async () => {
   const S = sandbox();
   const R = await startRunner(S, {});
   const { c } = await mcp(S, R, "chat");
   const names = (await c.listTools()).tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ["ask_owner", "notify_owner", "permission", "start_task", "track_issue", "wiki_capture"]);
+  assert.deepEqual(names, ["ask_owner", "notify_owner", "permission", "start_task", "track_issue", "wa_delete", "wa_edit", "wa_mention", "wa_poll", "wa_react", "wa_reply", "wa_send_media", "wiki_capture"]);
 });
 
 test("permission tool denies AskUserQuestion and ExitPlanMode with the retry-alone message, denies what the guard denies, allows the rest", async () => {

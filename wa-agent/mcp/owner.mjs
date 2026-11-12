@@ -9,6 +9,8 @@
 //   notify_owner  kind done | critical (critical carries the code the bridge records); done is refused in the chat lane
 //   track_issue   registers a child or vehicle issue for the poller
 //   wiki_capture  asks the runner to run wiki-sync.sh (phase 6 seam)
+//   wa_react, wa_reply, wa_send_media, wa_poll, wa_mention, wa_edit, wa_delete
+//                 what a person does in WhatsApp (PLAN 2.14), in this lane's own chat only; messages are named by the #refs in the prompt
 // stdout carries JSON-RPC only.
 import net from "node:net";
 import { randomUUID } from "node:crypto";
@@ -67,7 +69,20 @@ export const TOOLS = [
   { name: "notify_owner", description: "Task lane to WhatsApp. kind done: the task is finished (short report). kind critical: a critical action Lord Faisal must run himself; text carries the exact command and why, code is the code he replies with as 'done <code>' or 'deny <code>'.", inputSchema: obj({ kind: { type: "string", enum: ["done", "critical"] }, text: { type: "string" }, code: { type: "string", description: "critical only, like k7q-4821" } }, ["kind", "text"]) },
   { name: "track_issue", description: "Register a child or vehicle issue of this task so its comments and status wake this lane.", inputSchema: obj({ issue: { type: "string" }, role: { type: "string", enum: ["child", "vehicle"] } }, ["issue"]) },
   { name: "wiki_capture", description: "Commit and push wiki pages already written under ~/.claude/wiki (runs wiki-sync.sh outside the model).", inputSchema: obj({}) },
+  // WhatsApp as a person uses it. They act in the chat of this lane only (you never name a chat), on messages named by the #ref tags in the prompt.
+  // At most 6 actions per minute and 30 per hour per chat.
+  { name: "wa_react", description: "React to a message with one emoji, like a person does. ref is the #ref tag of a message in this chat. An empty emoji takes your reaction back.", inputSchema: obj({ ref: { type: "string", description: "like #a1b2" }, emoji: { type: "string", description: "exactly one emoji, or empty" } }, ["ref", "emoji"]) },
+  { name: "wa_reply", description: "Send a text message that quotes the message with this #ref. Returns the #ref of what you sent.", inputSchema: obj({ ref: { type: "string" }, text: { type: "string" } }, ["ref", "text"]) },
+  { name: "wa_send_media", description: "Send a file as an image, sticker, document or video. path must be under ~/assistant or /xchg/inbox (a group chat: its own folder ~/assistant/groups/<id>, or a file that arrived in that group). Limits: image and sticker 5 MB, video 16 MB, document 20 MB. A sticker is made from an image (512x512 webp). Use stickers rarely.", inputSchema: obj({ path: { type: "string" }, kind: { type: "string", enum: ["image", "sticker", "document", "video"] }, caption: { type: "string" } }, ["path", "kind"]) },
+  { name: "wa_poll", description: "Create a poll in this chat (2 to 12 options). Votes come back as [hasil polling #ref: ...] on a later turn.", inputSchema: obj({ question: { type: "string" }, options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 12 }, multi: { type: "boolean", description: "allow more than one option" } }, ["question", "options"]) },
+  { name: "wa_mention", description: "Group chat only: send a message that mentions people. names are display names you have seen in this group (or the #ref of one of their messages); text must contain @<name> for each of them.", inputSchema: obj({ text: { type: "string" }, names: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 10 } }, ["text", "names"]) },
+  { name: "wa_edit", description: "Edit a text message you sent (within 15 minutes). Only your own messages.", inputSchema: obj({ ref: { type: "string" }, text: { type: "string" } }, ["ref", "text"]) },
+  { name: "wa_delete", description: "Delete a message you sent, for everyone. Only your own messages.", inputSchema: obj({ ref: { type: "string" } }, ["ref"]) },
 ];
+
+// tool name -> runner op. A WhatsApp action can wait on the socket and the bridge, so it gets a longer timeout than a quick tool.
+const WA_TOOLS = { wa_react: "wa_react", wa_reply: "wa_reply", wa_send_media: "wa_send_media", wa_poll: "wa_poll", wa_mention: "wa_mention", wa_edit: "wa_edit", wa_delete: "wa_delete" };
+const WA_DONE = { wa_react: "reaction sent", wa_reply: "sent", wa_send_media: "sent", wa_poll: "poll sent", wa_mention: "sent", wa_edit: "edited", wa_delete: "deleted" };
 
 const reply = (text, isError = false) => ({ isError, content: [{ type: "text", text }] });
 
@@ -92,7 +107,11 @@ export async function callTool(name, args, env = process.env) {
       if (kind === "critical" && !CODE_RE.test(String(args.code ?? ""))) return reply("critical needs a code like k7q-4821 (3-8 letters or digits, a dash, 3-6 digits)", true);
       return show(await rpc("notify", { kind, text, code: kind === "critical" ? String(args.code).toLowerCase() : null, nid: randomUUID() }), () => "sent");
     }
-    default: return reply(`unknown tool ${name}`, true);
+    default: {
+      if (!Object.hasOwn(WA_TOOLS, name)) return reply(`unknown tool ${name}`, true);
+      const a = args && typeof args === "object" ? args : {};
+      return show(await rpc(WA_TOOLS[name], { ref: a.ref, text: a.text, emoji: a.emoji, path: a.path, kind: a.kind, caption: a.caption, question: a.question, options: a.options, names: a.names, multi: a.multi }, { timeoutMs: 120000 }), (r) => `${WA_DONE[name]}${r.ref ? ` ${r.ref}` : ""}`);
+    }
   }
 }
 

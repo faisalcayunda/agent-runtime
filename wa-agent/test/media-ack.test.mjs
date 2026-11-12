@@ -9,6 +9,9 @@ import { createCore, mediaNotes } from "../src/bridge.mjs";
 import { openState } from "../src/state.mjs";
 import { fakeBin, sandbox, tmp, waitFor } from "../testlib/helpers.mjs";
 import { attach } from "../src/ipc.mjs";
+import { addRef } from "../src/wa-actions.mjs";
+// The ref the bridge gives a message of a lane (4 hex characters of a hash, stable for the same lane and id).
+const rf = (lane, id) => addRef({ refs: {} }, lane, { id }).ref;
 import { connect, startRunner } from "../testlib/harness.mjs";
 
 const FAM = "120363@g.us", OTHER = "120999@g.us", LF = "grp_120363";
@@ -270,13 +273,13 @@ test("owner DM: image and sticker paths are in the prompt with the caption; an o
   const b = mk(S);
   await up(b);
   await b.core.onMessage(dm("i1", "ini apa?", { media: { kind: "image", path: "/xchg/inbox/i1.jpg" }, files: ["/xchg/inbox/i1.jpg"] }));
-  assert.equal(b.turns()[0].prompt, "ini apa?\n[gambar: /xchg/inbox/i1.jpg]");
+  assert.equal(b.turns()[0].prompt, `[#${rf("chat", "i1")}] ini apa?\n[gambar: /xchg/inbox/i1.jpg]`);
   await b.core.onRunnerEvent(result("chat"));
   await b.core.onMessage(dm("s1", "", { media: { kind: "sticker", path: "/xchg/inbox/s1.webp" }, files: ["/xchg/inbox/s1.webp"] }));
-  assert.equal(b.turns()[1].prompt, "[stiker: /xchg/inbox/s1.webp]");
+  assert.equal(b.turns()[1].prompt, `[#${rf("chat", "s1")}] [stiker: /xchg/inbox/s1.webp]`);
   await b.core.onRunnerEvent(result("chat"));
   await b.core.onMessage(dm("i2", "besar nih", { media: { kind: "image", tooLarge: true } }));
-  assert.equal(b.turns()[2].prompt, "besar nih\n[gambar: terlalu besar (>10 MB), dilewati]");
+  assert.equal(b.turns()[2].prompt, `[#${rf("chat", "i2")}] besar nih\n[gambar: terlalu besar (>10 MB), dilewati]`);
   assert.equal(b.turns().every((t) => t.videos === undefined), true);
 });
 
@@ -288,7 +291,7 @@ test("owner DM: a video is named in the prompt and handed to the runner; the bri
   writeFileSync(file, "VIDEO");
   await b.core.onMessage(dm("v1", "lihat ini", { media: { kind: "video", path: file, seconds: 8 }, files: [file] }));
   const t = b.turns()[0];
-  assert.equal(t.prompt, "lihat ini\n[video: v1.mp4]");
+  assert.equal(t.prompt, `[#${rf("chat", "v1")}] lihat ini\n[video: v1.mp4]`);
   assert.deepEqual(t.videos, [{ name: "v1.mp4", seconds: 8 }]);
   assert.equal(existsSync(file), true);                            // still there while the turn runs
   await b.core.onRunnerEvent(result("chat"));
@@ -300,10 +303,10 @@ test("group: a caption-less sticker or image that addresses Gremio (a reply) sta
   const b = mk(S);
   await up(b);
   await b.core.onMessage(gmsg("g1", "", { extra: { media: { kind: "sticker", path: "/xchg/inbox/g1.webp" }, files: ["/xchg/inbox/g1.webp"] } }));
-  assert.equal(b.turns()[0].prompt, "[Budi] [stiker: /xchg/inbox/g1.webp]");
+  assert.equal(b.turns()[0].prompt, `[Budi #${rf(LF, "g1")}] [stiker: /xchg/inbox/g1.webp]`);
   await b.core.onRunnerEvent(result(LF));
   await b.core.onMessage(gmsg("g2", "gremio ini apa", { extra: { media: { kind: "image", path: "/xchg/inbox/g2.jpg" }, files: ["/xchg/inbox/g2.jpg"] } }));
-  assert.equal(b.turns()[1].prompt, "[Budi] gremio ini apa\n[gambar: /xchg/inbox/g2.jpg]");
+  assert.equal(b.turns()[1].prompt, `[Budi #${rf(LF, "g2")}] gremio ini apa\n[gambar: /xchg/inbox/g2.jpg]`);
   await b.core.onRunnerEvent(result(LF));
   await b.core.onMessage(gmsg("g3", "gremio", { extra: { media: { kind: "video", path: "/xchg/inbox/g3.mp4", seconds: 5 }, files: ["/xchg/inbox/g3.mp4"] } }));
   assert.deepEqual(b.turns()[2].videos, [{ name: "g3.mp4", seconds: 5 }]);

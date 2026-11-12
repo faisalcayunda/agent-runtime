@@ -193,11 +193,11 @@ test("a vote event reaches onVote with the decoded labels, or null when it canno
   const up = F.handlers["messages.upsert"];
   await up({ type: "notify", messages: [{ key: { id: "V", remoteJid: OWNER }, messageTimestamp: 1, message: { pollUpdateMessage: vote("P1").pollUpdate } }] });
   await waitFor(() => got.votes.length === 1);
-  assert.deepEqual(got.votes[0], { pollId: "P1", options: ["React"] });
+  assert.deepEqual(got.votes[0], { pollId: "P1", options: ["React"], voter: "owner", owner: true });
   F.lib.decryptPollVote = () => { throw new Error("bad"); };
   await up({ type: "notify", messages: [{ key: { id: "V2", remoteJid: OWNER }, messageTimestamp: 2, message: { pollUpdateMessage: vote("P1").pollUpdate } }] });
   await waitFor(() => got.votes.length === 2);
-  assert.deepEqual(got.votes[1], { pollId: "P1", options: null });
+  assert.deepEqual(got.votes[1], { pollId: "P1", options: null, voter: "owner", owner: true });
   await up({ type: "notify", messages: [{ key: { id: "V3", remoteJid: "628222@s.whatsapp.net" }, messageTimestamp: 3, message: { pollUpdateMessage: vote("P1").pollUpdate } }] }); // a stranger's vote
   assert.equal(got.votes.length, 2);
 });
@@ -272,7 +272,7 @@ test("upsert: group messages reach the bridge only through the gate, and nothing
     gm({ id: "u7", remoteJid: "628222@s.whatsapp.net", participant: undefined }, "gremio cek"), // DM from a stranger
   ] });
   assert.deepEqual(got.messages.map((x) => x.id), ["u5", "u6"]);
-  assert.deepEqual(got.messages[0].group, { jid: FAM, fromOwner: false, family: true, name: "Budi", quote: { key: { id: "u5", remoteJid: FAM, participant: MEMBER }, message: { conversation: "gremio cek" } } });
+  assert.deepEqual(got.messages[0].group, { jid: FAM, fromOwner: false, family: true, name: "Budi", jids: [MEMBER], quote: { key: { id: "u5", remoteJid: FAM, participant: MEMBER }, message: { conversation: "gremio cek" } } });
   assert.equal(got.messages[1].group.fromOwner, true);
   assert.equal(got.messages[1].group.family, false);
   assert.deepEqual(logs.filter((l) => /g\.us|group|grup/i.test(l)), []);               // no group log line at all
@@ -434,4 +434,218 @@ test("react: an allowlisted emoji is sent as given (DM and group); anything else
   await wa.react({ id: "M4", remoteJid: FAM, participant: MEMBER }, { jid: FAM, emoji: "x" });
   const sends = F.sent.filter((x) => x.content?.react);
   assert.deepEqual(sends.map((x) => [x.jid, x.content.react.text]), [[OWNER, "\u{1F6E0}\uFE0F"], [FAM, "\u2764\uFE0F"], [OWNER, ACK_EMOJI], [FAM, ACK_EMOJI]]);
+});
+
+// ---------- human-like actions and perception (PLAN 2.14) ----------
+// Message shapes here are written from Baileys 7.0.0-rc13's own sources (Utils/messages.js, Utils/process-message.js), not from a real
+// account: polls made by others, edits, locations, contacts and reactions are verified against this fake socket only.
+const ctxMention = (jids) => ({ mentionedJid: jids });
+const SECRET = Buffer.from("0123456789abcdef0123456789abcdef");
+const pollMsg = (key, name = "Futsal?", options = ["ikut", "gak"], ver = "pollCreationMessageV3", extra = {}) => ({
+  key: { id: "P1", remoteJid: FAM, participant: MEMBER, ...key }, pushName: "Budi", messageTimestamp: 1_800_000_000,
+  message: { [ver]: { name, selectableOptionsCount: 1, options: options.map((optionName) => ({ optionName })) }, messageContextInfo: { messageSecret: SECRET }, ...extra },
+});
+
+test("normalizeMessage reads polls (all three versions), locations, live locations, contacts, mentions and what a reply replies to", () => {
+  const n = (message) => normalizeMessage(m({}, message));
+  for (const ver of ["pollCreationMessage", "pollCreationMessageV2", "pollCreationMessageV3"]) {
+    assert.deepEqual(n({ [ver]: { name: "Q?", selectableOptionsCount: ver === "pollCreationMessage" ? 3 : 1, options: [{ optionName: "a" }, { optionName: "b" }] } }).poll, { question: "Q?", options: ["a", "b"], multi: ver === "pollCreationMessage" }, ver);
+  }
+  assert.equal(n({ pollCreationMessageV3: { name: "Q?", options: [] } }).poll, undefined);
+  assert.deepEqual(n({ locationMessage: { degreesLatitude: -6.2, degreesLongitude: 106.8, name: "Monas", address: "Gambir" } }).location, { lat: -6.2, lng: 106.8, name: "Monas", address: "Gambir", caption: "", live: false });
+  assert.deepEqual(n({ liveLocationMessage: { degreesLatitude: 1, degreesLongitude: 2, caption: "otw" } }).location, { lat: 1, lng: 2, name: "", address: "", caption: "otw", live: true });
+  const vcard = "BEGIN:VCARD\nVERSION:3.0\nFN:Ibu\nTEL;type=CELL;type=VOICE;waid=6281234567890:+62 812-3456-7890\nitem1.TEL:08123\nEND:VCARD";
+  assert.deepEqual(n({ contactMessage: { displayName: "Ibu", vcard } }).contacts, [{ name: "Ibu", numbers: ["+6281234567890", "08123"] }]);
+  assert.deepEqual(n({ contactsArrayMessage: { contacts: [{ displayName: "A", vcard: "TEL:+111111" }, { displayName: "B", vcard: "no number" }] } }).contacts, [{ name: "A", numbers: ["+111111"] }, { name: "B", numbers: [] }]);
+  assert.deepEqual(n({ extendedTextMessage: { text: "hai", contextInfo: ctxMention(["99:1@s.whatsapp.net", "555@lid"]) } }).mentionedJid, ["99@s.whatsapp.net", "555@lid"]);
+  assert.deepEqual(n({ extendedTextMessage: { text: "ok", contextInfo: { stanzaId: "S9", participant: MEMBER, quotedMessage: { conversation: "x" } } } }).quotedKey, { id: "S9", participant: MEMBER });
+  assert.equal(n({ conversation: "polos" }).quotedKey, undefined);
+});
+
+test("a poll made by a member of the family group, or by the owner anywhere, reaches the bridge with its creation message; anyone else's does not", async () => {
+  const S = sandbox();
+  const seen = [];
+  const { F, got } = await startWa(S, { groups: new Set([FAM]), onSeen: (n) => seen.push(n) });
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [
+    pollMsg({ id: "P1" }),                                                      // family member
+    pollMsg({ id: "P2", remoteJid: OTHER }),                                    // member of another group: nobody's business
+    pollMsg({ id: "P3", remoteJid: OTHER, participant: OWNER }),                // the owner in another group
+    pollMsg({ id: "P4", fromMe: true }),                                        // our own, already kept when we sent it
+    pollMsg({ id: "P5", remoteJid: "120777@g.us" }),                            // an unknown group
+    pollMsg({ id: "P6", remoteJid: OTHER, participant: "555@lid" }, "Q?", ["a", "b"], "pollCreationMessageV2"), // an unknown LID whose phone twin is the owner
+  ] });
+  assert.deepEqual(seen.map((n) => n.id), ["P1", "P3", "P6"]);
+  assert.deepEqual(got.messages, []);                                           // no turn input at this level
+  const n = seen[0];
+  assert.deepEqual([n.poll.question, n.poll.options, n.group.jid, n.group.fromOwner, n.group.name, n.group.jids], ["Futsal?", ["ikut", "gak"], FAM, false, "Budi", [MEMBER]]);
+  const back = JSON.parse(n.pollRaw, baileys.BufferJSON.reviver);               // what state.json keeps: key, message and the secret
+  assert.equal(back.key.participant, MEMBER);
+  assert.equal(Buffer.from(back.message.messageContextInfo.messageSecret).toString(), SECRET.toString());
+  assert.equal(seen[1].group.fromOwner, true);
+});
+
+test("a poll that addresses Gremio (a mention) is a message with its poll and creation message; in the owner's DM too", async () => {
+  const S = sandbox();
+  const { F, got } = await startWa(S, { groups: new Set([FAM]), onSeen() { assert.fail("an addressed poll is a message"); } });
+  const withMention = (key) => { const p = pollMsg(key); p.message.pollCreationMessageV3.contextInfo = ctxMention(["99@s.whatsapp.net"]); return p; };
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [withMention({ id: "P1" }), pollMsg({ id: "P2", remoteJid: OWNER, participant: undefined })] });
+  assert.deepEqual(got.messages.map((x) => [x.id, x.poll?.question, typeof x.pollRaw]), [["P1", "Futsal?", "string"], ["P2", "Futsal?", "string"]]);
+  assert.equal(got.messages[1].key.id, "P2");
+});
+
+test("votes of group members on a kept poll are decrypted with the creator's JIDs and reach the bridge with the voter; unknown polls are ignored", async () => {
+  const S = sandbox();
+  const F = fakeLib();
+  const tried = [];
+  F.lib.getKeyAuthor = (k, me) => k.participant ?? k.remoteJid ?? me;
+  F.lib.decryptPollVote = (vote, o) => { tried.push(o); if (o.pollCreatorJid !== MEMBER || o.voterJid !== "628333@s.whatsapp.net") throw new Error("bad mac"); return { selectedOptions: ["h"] }; };
+  F.lib.getAggregateVotesInPollMessage = () => [{ name: "ikut", voters: ["x"] }, { name: "gak", voters: [] }];
+  const raw = JSON.stringify(pollMsg({ id: "P1" }), baileys.BufferJSON.replacer);
+  const got = { votes: [] };
+  const wa = createWa({ lib: F.lib, owners, groups: new Set([FAM]), ownerJid: OWNER, authDir: S.dir, xchg: S.xchg, polls: { get: (id) => (id === "P1" ? raw : undefined) }, log() {}, onMessage() {}, onVote: (v) => got.votes.push(v) });
+  await wa.start();
+  const vote = (key, id = "P1") => ({ key: { id: "V1", remoteJid: FAM, participant: "628333@s.whatsapp.net", ...key }, messageTimestamp: 1_800_000_001, message: { pollUpdateMessage: { pollCreationMessageKey: { id, remoteJid: FAM, participant: MEMBER }, vote: { encPayload: "x", encIv: "y" } } } });
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [vote({}), vote({ id: "V2" }, "UNKNOWN"), vote({ participant: undefined, id: "V3" }), vote({ fromMe: true, id: "V4" })] });
+  await waitFor(() => got.votes.length === 1);
+  assert.deepEqual(got.votes[0], { pollId: "P1", options: ["ikut"], voter: "628333@s.whatsapp.net", owner: false });
+  assert.ok(tried.some((o) => o.pollCreatorJid === MEMBER)); // the creator is the member who made it, not Gremio
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(got.votes.length, 1);                          // an unknown poll, a vote with no voter and our own echo count for nothing
+  // the same vote arriving again as a message update gives the same voter and the same labels
+  F.handlers["messages.update"]([{ key: { id: "P1", remoteJid: FAM, participant: MEMBER }, update: { pollUpdates: [{ pollUpdateMessageKey: { id: "V1", remoteJid: FAM, participant: "628333@s.whatsapp.net" }, vote: { encPayload: "x", encIv: "y" } }] } }]);
+  await waitFor(() => got.votes.length === 2);
+  assert.deepEqual(got.votes[1], got.votes[0]);
+});
+
+test("an owner's vote in another group is the voter 'owner'", async () => {
+  const S = sandbox();
+  const F = fakeLib();
+  F.lib.getKeyAuthor = (k, me) => k.participant ?? me;
+  F.lib.decryptPollVote = () => ({ selectedOptions: ["h"] });
+  F.lib.getAggregateVotesInPollMessage = () => [{ name: "a", voters: ["x"] }];
+  const raw = JSON.stringify(pollMsg({ id: "P1", remoteJid: OTHER, fromMe: true, participant: undefined }), baileys.BufferJSON.replacer);
+  const got = { votes: [] };
+  const wa = createWa({ lib: F.lib, owners, groups: new Set(), ownerJid: OWNER, authDir: S.dir, xchg: S.xchg, polls: { get: () => raw }, log() {}, onMessage() {}, onVote: (v) => got.votes.push(v) });
+  await wa.start();
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [{ key: { id: "V1", remoteJid: OTHER, participant: OWNER }, messageTimestamp: 1, message: { pollUpdateMessage: { pollCreationMessageKey: { id: "P1" }, vote: { encPayload: "x", encIv: "y" } } } }] });
+  await waitFor(() => got.votes.length === 1);
+  assert.deepEqual(got.votes[0], { pollId: "P1", options: ["a"], voter: "owner", owner: true });
+});
+
+test("getMessage serves a kept poll of someone else, so Baileys can decrypt its votes", async () => {
+  const S = sandbox();
+  const raw = JSON.stringify(pollMsg({ id: "P1" }), baileys.BufferJSON.replacer);
+  const { F } = await startWa(S, { polls: { get: (id) => (id === "P1" ? raw : undefined) } });
+  const back = await F.sockets[0].cfg.getMessage({ id: "P1" });
+  assert.equal(back.pollCreationMessageV3.name, "Futsal?");
+  assert.equal(Buffer.from(back.messageContextInfo.messageSecret).toString(), SECRET.toString());
+});
+
+test("an edit arrives as a message update: the owner's DM and an addressed group message reach the bridge as edited, with the original's key and a ledger id of their own", async () => {
+  const S = sandbox();
+  const { F, got } = await startWa(S, { groups: new Set([FAM]) });
+  const edit = (key, text, ts = 1_800_000_050) => ({ key: { id: "ORIG", ...key }, update: { message: { editedMessage: { message: { conversation: text } } }, messageTimestamp: ts } });
+  F.handlers["messages.update"]([
+    edit({ remoteJid: OWNER }, "versi baru"),
+    edit({ remoteJid: FAM, participant: MEMBER }, "gremio versi baru"),
+    edit({ remoteJid: FAM, participant: MEMBER }, "bukan buat gremio"),          // chatter
+    edit({ remoteJid: "628222@s.whatsapp.net" }, "dari orang asing"),
+    edit({ remoteJid: OWNER, fromMe: true }, "dari kita sendiri"),
+    { key: { id: "ORIG", remoteJid: OWNER }, update: { message: null, messageStubType: 1 } },   // a delete
+    { key: { id: "ORIG", remoteJid: OWNER }, update: { status: 3 } },                           // a receipt
+  ]);
+  await waitFor(() => got.messages.length === 2);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(got.messages.length, 2);
+  const [d, g] = got.messages;
+  assert.deepEqual([d.text, d.edited, d.id, d.key.id, d.media], ["versi baru", true, "ORIG:edit:1800000050", "ORIG", null]);
+  assert.deepEqual([g.text, g.edited, g.id, g.group.quote.key.id, g.group.jid], ["gremio versi baru", true, "ORIG:edit:1800000050", "ORIG", FAM]);
+});
+
+test("a delete, an edit envelope and a reaction in messages.upsert are not messages", async () => {
+  const S = sandbox();
+  const { F, got } = await startWa(S, { groups: new Set([FAM]) });
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [
+    m({ remoteJid: OWNER, id: "x1" }, { protocolMessage: { type: 0, key: { id: "ORIG" } } }),
+    m({ remoteJid: OWNER, id: "x2" }, { protocolMessage: { type: 14, key: { id: "ORIG" }, editedMessage: { conversation: "baru" } } }),
+    m({ remoteJid: OWNER, id: "x3" }, { reactionMessage: { text: "👍", key: { id: "ORIG" } } }),
+    gm({ id: "x4" }, "", null, { message: { protocolMessage: { type: 0, key: { id: "ORIG" } } } }),
+  ] });
+  assert.deepEqual(got.messages, []);
+});
+
+test("messages.reaction: the owner in his DM, a family member or the owner in a group; strangers, our own echo and removals are ignored", async () => {
+  const S = sandbox();
+  const reactions = [];
+  const { F } = await startWa(S, { groups: new Set([FAM]), onReaction: (r) => reactions.push(r) });
+  const r = (rkey, text, key = { id: "GRMSG" }) => ({ key, reaction: { text, key: { id: "RX", ...rkey }, senderTimestampMs: 1 } });
+  F.handlers["messages.reaction"]([
+    r({ remoteJid: OWNER }, "👍", { id: "A1", remoteJid: OWNER, fromMe: true }),
+    r({ remoteJid: "628222@s.whatsapp.net" }, "👍"),                                // a stranger's DM
+    r({ remoteJid: OWNER, fromMe: true }, "👀"),                                    // our own reaction coming back
+    r({ remoteJid: OWNER }, ""),                                                    // the owner took it back
+    r({ remoteJid: FAM, participant: MEMBER }, "😂", { id: "A2", remoteJid: FAM, fromMe: true }),
+    r({ remoteJid: OTHER, participant: MEMBER }, "😂"),                             // a member of another group
+    r({ remoteJid: OTHER, participant: OWNER }, "🙏", { id: "A3", remoteJid: OTHER }),
+    r({ remoteJid: "120777@g.us", participant: OWNER }, "🙏"),                      // the owner in a group: his, even if the bridge has no lane for it (it decides)
+    r({ remoteJid: FAM, participant: "555@lid" }, "❤️", { id: "A4", remoteJid: FAM }), // an unknown LID whose twin is the owner
+  ]);
+  await waitFor(() => reactions.length === 5);
+  assert.deepEqual(reactions.map((x) => [x.chat, x.id, x.emoji, x.owner]), [[null, "A1", "👍", true], [FAM, "A2", "😂", false], [OTHER, "A3", "🙏", true], ["120777@g.us", "GRMSG", "🙏", true], [FAM, "A4", "❤️", true]]);
+  assert.deepEqual(reactions[1].jids, [MEMBER]);
+});
+
+test("mentions in a message are classified: Gremio (phone or LID), the owner, anyone else", async () => {
+  const S = sandbox();
+  const { F, got } = await startWa(S, { groups: new Set([FAM]) });
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [
+    gm({ id: "m1" }, "@99 @77 @628111 @628333", ctxMention(["99@s.whatsapp.net", "77@lid", OWNER, "628333@s.whatsapp.net"])),
+    { key: { id: "m2", remoteJid: OWNER }, messageTimestamp: 1_800_000_000, message: { extendedTextMessage: { text: "tanya @628333", contextInfo: ctxMention(["628333@s.whatsapp.net"]) } } },
+  ] });
+  assert.deepEqual(got.messages[0].mentions, [{ jid: "99@s.whatsapp.net", who: "gremio" }, { jid: "77@lid", who: "gremio" }, { jid: OWNER, who: "owner" }, { jid: "628333@s.whatsapp.net", who: null }]);
+  assert.deepEqual(got.messages[1].mentions, [{ jid: "628333@s.whatsapp.net", who: null }]);
+});
+
+test("the new sends take the owner or a group JID the bridge picked, never another JID, and a key must belong to the chat", async () => {
+  const S = sandbox();
+  const { F, wa } = await startWa(S, { groups: new Set([FAM]) });
+  const dmKey = { id: "M1", remoteJid: "555@lid", fromMe: false }, grpKey = { id: "M2", remoteJid: FAM, participant: MEMBER, fromMe: false };
+  await wa.reactAny(dmKey, "🎉");
+  await wa.reactAny(grpKey, "🫶", { jid: FAM });
+  await wa.reactAny(grpKey, "", { jid: FAM });
+  await wa.reply("oke", { key: dmKey, message: { conversation: "halo" } }, { id: messageId("r1") });
+  await wa.reply("siap", { key: grpKey, message: { conversation: "gremio" } }, { jid: FAM, id: messageId("r2") });
+  await wa.sendMention("@628222 cek", [MEMBER], { jid: FAM, id: messageId("m1") });
+  await wa.sendPoll("Makan?", ["a", "b"], { jid: FAM, id: messageId("p1"), multi: true });
+  await wa.sendMedia({ kind: "image", data: Buffer.from("x"), mimetype: "image/png", caption: "nih" }, { id: messageId("i1") });
+  await wa.sendMedia({ kind: "sticker", data: Buffer.from("x") }, { jid: FAM });
+  await wa.sendMedia({ kind: "document", data: Buffer.from("x"), mimetype: "application/pdf", fileName: "a.pdf" }, { jid: FAM });
+  await wa.sendMedia({ kind: "video", data: Buffer.from("x"), mimetype: "video/mp4", caption: "c" });
+  await wa.edit(messageId("t"), "baru");
+  await wa.edit(messageId("t"), "baru", { jid: FAM });
+  await wa.remove(messageId("t"), { jid: FAM });
+  assert.deepEqual(F.sent.map((s) => s.jid), [OWNER, FAM, FAM, OWNER, FAM, FAM, FAM, OWNER, FAM, FAM, OWNER, OWNER, FAM, FAM]);
+  assert.deepEqual(F.sent[0].content.react, { text: "🎉", key: dmKey });
+  assert.equal(F.sent[2].content.react.text, "");
+  assert.deepEqual(F.sent[3].opts.quoted, { key: dmKey, message: { conversation: "halo" } });
+  assert.deepEqual(F.sent[5].content, { text: "@628222 cek", mentions: [MEMBER] });
+  assert.deepEqual(F.sent[6].content.poll, { name: "Makan?", values: ["a", "b"], selectableCount: 2 });
+  assert.deepEqual(Object.keys(F.sent[7].content), ["image", "mimetype", "caption"]);
+  assert.deepEqual(Object.keys(F.sent[8].content), ["sticker"]);
+  assert.deepEqual(F.sent[9].content, { document: Buffer.from("x"), mimetype: "application/pdf", fileName: "a.pdf" });
+  assert.equal(F.sent[10].content.video.toString(), "x");
+  assert.deepEqual(F.sent[11].content.edit, { remoteJid: OWNER, fromMe: true, id: messageId("t") });
+  assert.deepEqual(F.sent[12].content.edit, { remoteJid: FAM, fromMe: true, id: messageId("t") });
+  assert.deepEqual(F.sent[13].content.delete, { remoteJid: FAM, fromMe: true, id: messageId("t") });
+  const n = F.sent.length;
+  // refused: a JID that is not a group, a group key for the owner's DM, a key of another group, a DM key for a group, a kind it does not know
+  for (const call of [
+    () => wa.reactAny(dmKey, "👍", { jid: OWNER }), () => wa.reactAny(dmKey, "👍", { jid: "628222@s.whatsapp.net" }),
+    () => wa.reactAny(grpKey, "👍"), () => wa.reactAny({ ...grpKey, remoteJid: OTHER }, "👍", { jid: FAM }), () => wa.reactAny({ id: "M3", remoteJid: OWNER }, "👍", { jid: FAM }),
+    () => wa.reply("x", { key: grpKey, message: {} }), () => wa.reply("x", { key: { id: "M" }, message: {} }, { jid: OWNER }),
+    () => wa.sendMention("x", [MEMBER], { jid: OWNER }), () => wa.sendPoll("q", ["a", "b"], { jid: "x@s.whatsapp.net" }),
+    () => wa.sendMedia({ kind: "audio", data: Buffer.from("x") }), () => wa.sendMedia({ kind: "image", data: Buffer.from("x") }, { jid: OWNER }),
+    () => wa.edit("", "x"), () => wa.edit(messageId("t"), "x", { jid: OWNER }), () => wa.remove(messageId("t"), { jid: "628222@s.whatsapp.net" }), () => wa.remove(undefined),
+  ]) await assert.rejects(call, /not the owner or a group JID/);
+  assert.equal(F.sent.length, n);
 });

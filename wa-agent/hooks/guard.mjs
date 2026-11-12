@@ -260,11 +260,29 @@ function gitRules(a, ctx) {
   return null;
 }
 
+// wa_send_media (PLAN 2.14): the runner and the bridge check the path again; this is the first of three checks, so a group lane never even
+// asks to send ~/assistant outside its own folder. Chat and task lanes: ~/assistant or /xchg/inbox. A group lane: its own folder
+// ~/assistant/groups/<id> (the bridge checks that an inbox file arrived in that group). Every spelling of the path, links resolved, must pass.
+function mediaPath(ti, ctx) {
+  const raw = String(ti.path ?? "");
+  if (!raw) return null; // the tool says what is missing
+  const task = String(ctx.task ?? "");
+  const p = absPath(raw, ctx);
+  for (const cand of new Set([p, real(p)])) {
+    const inbox = strictlyInside(cand, join(ctx.xchg, "inbox"));
+    const ok = ctx.lane === "group"
+      ? inbox || (/^grp_[\d-]+$/.test(task) && homesOf(ctx).some((h) => strictlyInside(cand, join(h, "assistant", "groups", task.slice(4)))))
+      : inbox || homesOf(ctx).some((h) => strictlyInside(cand, join(h, "assistant")));
+    if (!ok) return deny("media-path", ctx.lane === "group" ? "a group chat can send files only from its own folder ~/assistant/groups/<id> or ones that arrived in that group" : "wa_send_media sends only files under ~/assistant or /xchg/inbox");
+  }
+  return null;
+}
+
 const SQL_DROP = /\bdrop\s+(table|database|schema)\b/i;
 // Also matches the shell `truncate <file>`; `truncate -s N file` is not matched. Accepted false positive.
 const SQL_TRUNCATE = /\btruncate\b(\s+table)?\s+(?!-)[\w."`]+/i;
 // Rules whose denial the model can fix by changing the command; every other denial means "the owner runs it".
-const FIXABLE = new Set(["merge-needs-url", "git-push-no-refspec", "git-push-glob", "multica-comment-prefix", "multica-comment-body-unchecked", "memory-write-not-chat-lane", "approval-no-grant", "merge-no-grant", "git-push-protected", "rm-rf-outside-assistant", "grant-already-used"]);
+const FIXABLE = new Set(["merge-needs-url", "git-push-no-refspec", "git-push-glob", "multica-comment-prefix", "multica-comment-body-unchecked", "memory-write-not-chat-lane", "approval-no-grant", "merge-no-grant", "git-push-protected", "rm-rf-outside-assistant", "grant-already-used", "media-path"]);
 export function denyMessage(v) {
   const tail = FIXABLE.has(v.rule)
     ? "Change the command as the reason says, or do not do this step."
@@ -496,7 +514,8 @@ export function evaluate(input, ctx0 = {}) {
     if (rule) verdict = writeDenied(rule);
   } else if (tool.startsWith("mcp__")) {
     subject = tool;
-    if (!NO_SQL_SCAN.test(tool)) for (const s of strings(ti)) { verdict = sqlRules(s); if (verdict) break; } // owner and context7 carry prose, not SQL
+    if (tool === "mcp__owner__wa_send_media") verdict = mediaPath(ti, ctx);
+    if (!verdict && !NO_SQL_SCAN.test(tool)) for (const s of strings(ti)) { verdict = sqlRules(s); if (verdict) break; } // owner and context7 carry prose, not SQL
   }
   return { tool, subject, verdict };
 }

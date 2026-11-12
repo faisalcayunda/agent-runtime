@@ -7,7 +7,8 @@
 // destinations (wa.react: the owner, or the message's own group); routing order for an inbound owner text is (1)
 // `done|deny <kode>`, (2) the head question, (3) the chat lane; one FIFO question queue across the owner's lanes; a group
 // message never enters that routing (no grants, no owner answers, only /baru); the bridge starts every turn and owns every
-// session id; every write goes through safeWrite.
+// session id; every write goes through safeWrite. The actions of a normal user (react, reply, media, poll, mention, edit, delete,
+// PLAN 2.14) come from the runner as `wa-action`; the bridge picks the destination from the lane that asked and validates the rest.
 import net from "node:net";
 import { readdirSync, statSync, unlinkSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -17,13 +18,16 @@ import { CODE_PATTERN, PR_URL, deleteGrant, isMergeYes, parseApproval, pushMainO
 import { parseCommand } from "./commands.mjs";
 import { questionsOf } from "./stream.mjs";
 import { attach, send } from "./ipc.mjs";
-import { MEDIA_CAPS, messageId } from "./wa.mjs";
+import { MEDIA_CAPS, maskJid, messageId } from "./wa.mjs";
+import { NOTES_MAX, PERSON_JID, SEND_CAPS, addPerson, addRef, cleanName, extraLines, findMsg, findRef, isEmojiOrEmpty, isWebp, mimeOf, personName, pollLine, pollResultLine, rateLimiter, readCapped, refTable } from "./wa-actions.mjs";
 import { createHealth, httpGet } from "./health.mjs";
 import { groupLaneId, inside, isGroupLane, validFile, validId } from "./ids.mjs";
 import { ACK_TRIGGER_MAX, REACT_TRIGGER_MAX, cleanAck, cleanEmoji } from "./ack.mjs";
 
 const MAX_TEXT = 4000; // WhatsApp message length we split at (UNVERIFIED limit, PLAN 2.2 step 4)
 const POLL_MAX_OPTIONS = 12;
+const EDIT_WINDOW_MS = 15 * 60 * 1000; // WhatsApp lets a message be edited for 15 minutes
+const ACTION_MS = 60000;                // the longest the bridge works on one action before it tells the model it did not confirm
 const CODE_TTL_MS = 24 * 3600 * 1000;
 const POLL_UNREADABLE = "poll-nya gak kebaca, jawab pakai angka aja ya";
 // Acknowledge work (owner decision 2026-11-12): a 👀 when a turn has said nothing for REACT_MS, and one short line after ACK_MS.
@@ -86,7 +90,7 @@ export function renderQuestion(head, { group = false } = {}) {
   return `${n}${q.question}${list ? "\n" + list : ""}${how}`;
 }
 
-export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, log = () => {}, setTimer = (f, ms) => { const t = setTimeout(f, ms); t.unref(); return t; }, clearTimer = clearTimeout, ackMs = ACK_MS, reactMs = REACT_MS, ackTextMs = ACK_TEXT_MS, reactEmojiMs = REACT_EMOJI_MS, statusMs = 2000 }) {
+export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, actionMs = ACTION_MS, log = () => {}, setTimer = (f, ms) => { const t = setTimeout(f, ms); t.unref(); return t; }, clearTimer = clearTimeout, ackMs = ACK_MS, reactMs = REACT_MS, ackTextMs = ACK_TEXT_MS, reactEmojiMs = REACT_EMOJI_MS, statusMs = 2000 }) {
   const S = state.d;
   const save = () => state.save();
   const known = (id) => id === "chat" || (validId(id) && !!S.lanes[id]);
@@ -108,8 +112,10 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   async function sendOnce(key, text, to = null, retry = true) {
     if (S.outbox[key] || !text.trim()) return;
     const parts = splitText(text);
+    const rl = to ? groupLaneId(to.jid) : "chat"; // every message Gremio sends is a record its lane (and nobody else) can react to, edit or delete
     try {
       for (let i = 0; i < parts.length; i++) {
+        if (rl) recordSent(rl, messageId(key, i), parts[i], to?.jid ?? null);
         if (to) await wa.sendGroup(to.jid, parts[i], { id: messageId(key, i), ...(i === 0 && to.quote ? { quote: to.quote } : {}) });
         else await wa.sendText(parts[i], { id: messageId(key, i) });
       }
@@ -133,6 +139,46 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     return { jid: g.jid, quote: S.lanes[id]?.quote ?? null };
   };
 
+  // ---- refs and what a lane has seen (PLAN 2.14) ----
+  // A ref is an opaque id this bridge gives the model for a message of one lane; the key behind it never leaves bridge state.
+  // `mine` comes only from recordSent, so a quote or an edit a member sends can never make one of their messages Gremio's.
+  const recordSent = (lane, id, text, chat = null, kind = "text") => addRef(S, lane, { id, chat, mine: true, kind, text: String(text ?? "").slice(0, 200), ts: now() });
+  function refIn(lane, key, { text, file, kind = "text" } = {}) {
+    if (!key?.id) return "";
+    return addRef(S, lane, { id: key.id, chat: key.remoteJid ?? null, from: key.participant ?? null, mine: false, kind, text: String(text ?? "").slice(0, 200), ...(file ? { file: basename(file) } : {}), ts: now() }).ref;
+  }
+  // The message a reply replies to: its ref when the sender's client named it (a quote of one of Gremio's own messages finds its send record).
+  function quotedRef(lane, n, chat) {
+    const k = n.quotedKey;
+    if (!k?.id || !n.quoted?.text) return "";
+    return addRef(S, lane, { id: k.id, chat, from: k.participant ?? null, mine: false, kind: "text", text: String(n.quoted.text).slice(0, 200), ts: now() }).ref;
+  }
+  const nameIn = (lane) => (jid) => personName(S, lane, jid) ?? maskJid(jid);
+  const keepPoll = (lane, n, ref) => {
+    if (!n.poll || !n.pollRaw || !n.id || S.xpolls[n.id]) return;
+    S.xpolls[n.id] = { raw: n.pollRaw, lane, ref, question: n.poll.question.slice(0, 250), options: n.poll.options.slice(0, POLL_MAX_OPTIONS), own: false, multi: n.poll.multi, votes: {}, ts: now() };
+  };
+  // Seen since the lane's last turn: kept (bounded) and shown with the next turn that a message starts; a note never starts one.
+  const addNote = (lane, note, dedupe) => {
+    const a = (S.notes[lane] ??= []);
+    if (dedupe) { const i = a.findIndex((x) => x.d === dedupe); if (i >= 0) a.splice(i, 1); }
+    a.push({ ...note, ...(dedupe ? { d: dedupe } : {}) });
+    if (a.length > NOTES_MAX) a.splice(0, a.length - NOTES_MAX);
+    save();
+  };
+  function takeNotes(lane) {
+    const list = S.notes[lane];
+    if (!list?.length) return "";
+    delete S.notes[lane];
+    const lines = [];
+    for (const nt of list) {
+      if (nt.k === "react") { lines.push(`[${cleanName(nt.name) || "?"} bereaksi ${nt.emoji} ke pesanmu #${nt.ref}]`); continue; }
+      const x = S.xpolls[nt.id];
+      if (x) lines.push(nt.k === "poll-new" ? pollLine(x.ref, { question: x.question, options: x.options }) : pollResultLine(x.ref, x.options, x.votes));
+    }
+    return lines.join("\n");
+  }
+
   // ---- turns ----
   const hasQuestion = (id) => (isGroupLane(id) ? !!S.gq[id]?.length : S.queue.some((q) => q.lane === id));
   // One group turn at a time across all groups: each is one more `claude` process on top of chat and the task lane (D20 memory budget).
@@ -147,13 +193,16 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     const items = L.resumeFirst || group ? [L.queue.shift()] : L.queue.splice(0);
     L.resumeFirst = false;
     const raw = items.map((i) => i.text).filter(Boolean);
+    const piece = (i) => { const b = i.pre ? `${i.pre}\n${i.text}` : i.text; return i.tag && b ? `${i.tag} ${b}` : b; };
+    const body = items.map(piece).filter(Boolean).join("\n\n");
+    const seen = body ? takeNotes(id) : ""; // reactions, tallies and polls since the last turn ride along; they never start one and never join an empty-prompt resume
     const videos = items.flatMap((i) => i.videos ?? []);
     L.inflight = { raw, ids: items.map((i) => i.id).filter(Boolean), answered: items.find((i) => i.answered)?.answered ?? null, ...(videos.length ? { videos } : {}), ...(group ? { fromOwner: items[0].fromOwner === true } : {}) };
     if (group && items[0].quote) L.quote = items[0].quote;
     save();
     const acked = items.filter((i) => i.ack);
     startAck(id, acked[0]?.id, acked.map((i) => i.text).filter(Boolean).join("\n").slice(0, ACK_TRIGGER_MAX));
-    toRunner({ op: "turn", lane: id, task: id === "chat" || group ? undefined : id, session: S.sessions[id] ?? null, prompt: items.map((i) => (i.pre ? `${i.pre}\n${i.text}` : i.text)).filter(Boolean).join("\n\n"), origin: L.inflight.ids, ...(videos.length ? { videos } : {}), ...(group ? { group: true, fromOwner: L.inflight.fromOwner } : {}) });
+    toRunner({ op: "turn", lane: id, task: id === "chat" || group ? undefined : id, session: S.sessions[id] ?? null, prompt: seen ? `${seen}\n\n${body}` : body, origin: L.inflight.ids, ...(videos.length ? { videos } : {}), ...(group ? { group: true, fromOwner: L.inflight.fromOwner } : {}) });
   }
   // extra: pre (what the message replies to: for the model only, it stays out of `raw`, which grants and requeues read),
   // videos (the runner turns them into frames) and ack (a user message that gets a reaction and maybe an ack line).
@@ -311,34 +360,41 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   // ---- inbound ----
   // The sender's name as the model sees it: one line, no brackets, and "(owner)" only where the WhatsApp layer proved it.
   const labelOf = (g) => `${String(g.name ?? "").replace(/[\[\]()]/g, "").replace(/\s+/g, " ").trim().slice(0, 40) || "?"}${g.fromOwner === true ? " (owner)" : ""}`;
-  const preOf = (q) => (q?.text ? `[membalas ${String(q.author ?? "?").replace(/[\[\]\n]/g, " ")}]: ${q.text}` : "");
+  const preOf = (q, ref = "") => (q?.text ? `[membalas ${String(q.author ?? "?").replace(/[\[\]\n]/g, " ")}${ref ? ` #${ref}` : ""}]: ${q.text}` : "");
   const ADDRESS = /^\s*(?:(?:@\d+|gremio)\b[\s,:;.!-]*)+/i;
   // A group message: its own lane per group, never route(). Allowed when the group is in the family list or the sender is the owner.
   async function onGroupMessage(n) {
     const g = n.group, id = groupLaneId(g.jid);
     const { notes, videos } = mediaNotes(n);
-    const text = [n.text?.trim(), ...notes].filter(Boolean).join("\n"); // a caption-less sticker or image is a message too
-    if (!id || !text || !(groups.has(g.jid) || g.fromOwner === true)) return;
+    // What the message says: its text (an edit is marked), its media, and what it carries besides text (poll, location, contact, mentions).
+    const lines = (ref) => [n.edited && n.text?.trim() ? `[diedit] ${n.text.trim()}` : n.text?.trim(), ...notes, ...extraLines(n, { ref, full: g.fromOwner === true, nameOf: nameIn(id) })].filter(Boolean).join("\n"); // a caption-less sticker or image is a message too
+    if (!id || !lines("") || !(groups.has(g.jid) || g.fromOwner === true)) return;
     S.groups[id] = { jid: g.jid, family: groups.has(g.jid) };
     S.lanes[id] ??= newLane();
+    addPerson(S, id, g.jids, g.name);
+    const ref = refIn(id, g.quote?.key, { text: n.text, file: n.media?.path, kind: n.poll ? "poll" : "text" });
+    const qref = quotedRef(id, n, g.jid);
+    keepPoll(id, n, ref);
+    const text = lines(ref);
     const bare = (n.text ?? "").replace(ADDRESS, "");
-    const cmd = parseCommand(bare);
+    const cmd = n.edited ? null : parseCommand(bare); // an edited message is plain text: it never runs a command or answers a question
     if (cmd) { // only /baru works in a group: /stop, /status and /memori belong to the owner's own chat
       if (cmd !== "baru") return save();
       const L = lane(id);
       delete S.sessions[id];
       delete S.gq[id];
+      delete S.notes[id];
       L.queue = [];
       if (L.inflight) L.fresh = true;
       L.quote = g.quote;
       save();
       return sendOnce(`cmd:${id}:${now()}`, "Sesi baru.", laneDest(id));
     }
-    if (S.gq[id]?.length) return answerGroupHead(id, bare.trim() ? bare : text, g);
-    const pre = preOf(n.quoted);
-    lane(id).queue.push({ text: `[${labelOf(g)}] ${pre ? pre + "\n" : ""}${text}`, id: n.id, quote: g.quote, fromOwner: g.fromOwner === true, ack: true, ...(videos.length ? { videos } : {}) });
+    if (!n.edited && S.gq[id]?.length) return answerGroupHead(id, bare.trim() ? bare : text, g);
+    const pre = preOf(n.quoted, qref);
+    lane(id).queue.push({ text: `[${labelOf(g)}${ref ? ` #${ref}` : ""}] ${pre ? pre + "\n" : ""}${text}`, id: n.id, quote: g.quote, fromOwner: g.fromOwner === true, ack: !n.edited, ...(videos.length ? { videos } : {}) });
     save();
-    if (laneDest(id)) deferReact(id, g.quote?.key, g.jid, text);
+    if (laneDest(id) && !n.edited) deferReact(id, g.quote?.key, g.jid, text);
     return pump(id);
   }
 
@@ -353,14 +409,20 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     if (n.group) return onGroupMessage(n);
     wa.composing();
     const { notes, videos } = mediaNotes(n);
-    const text = [n.text, ...notes].filter(Boolean).join("\n");
+    const ref = refIn("chat", n.key, { text: n.text, file: n.media?.path, kind: n.poll ? "poll" : "text" });
+    const pre = preOf(n.quoted, quotedRef("chat", n, n.key?.remoteJid ?? null));
+    keepPoll("chat", n, ref);
+    const text = [n.edited && n.text ? `[diedit] ${n.text}` : n.text, ...notes, ...extraLines(n, { ref, full: true, nameOf: nameIn("chat") })].filter(Boolean).join("\n");
     if (!text) return;
+    const tag = ref ? `[#${ref}]` : "";
+    // An edited message is plain chat text: it runs no command, answers no question and carries no approval code.
+    if (n.edited) return enqueue("chat", text, n.id, { ...(pre ? { pre } : {}), tag });
     const cmd = parseCommand(text);
     if (cmd) return runCommand(cmd);
-    return route(text, n.id, { pre: preOf(n.quoted), key: n.key, videos });
+    return route(text, n.id, { pre, key: n.key, videos, tag });
   }
 
-  async function route(text, msgId, { pre, key, videos = [] } = {}) {
+  async function route(text, msgId, { pre, key, videos = [], tag = "" } = {}) {
     const ap = parseApproval(text);
     const rec = ap && S.codes[ap.code];
     if (rec && known(rec.lane) && now() - rec.ts < CODE_TTL_MS) { // (1) goes to the lane whose message carried the code
@@ -370,16 +432,54 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     }
     if (S.queue[0]) return answerHead(parseAnswerFor(S.queue[0], text), text); // (2) the head question
     deferReact("chat", key, undefined, text);
-    return enqueue("chat", text, msgId, { ...(pre ? { pre } : {}), ...(videos.length ? { videos } : {}), ack: true }); // (3) the chat lane
+    return enqueue("chat", text, msgId, { ...(pre ? { pre } : {}), ...(tag ? { tag } : {}), ...(videos.length ? { videos } : {}), ack: true }); // (3) the chat lane
   }
   const parseAnswerFor = (head, text) => (head.kind === "ask-owner" ? text : parseAnswer(head.questions[head.cursor], text));
 
-  async function onVote({ pollId, options }) {
+  // A vote on a poll that is not a question of the owner's queue: Gremio's own poll (wa_poll) or someone else's. The latest vote of each
+  // voter counts, so the same vote arriving twice changes nothing. It is tallied, shown on the lane's next turn, and starts one only when
+  // the owner votes on a poll Gremio made (he answered it).
+  function voteOnPoll(pollId, options, voter, owner) {
+    const x = S.xpolls[pollId];
+    if (!x || options === null) return log("vote for a poll that is not kept, or not readable");
+    if (!S.lanes[x.lane] || (isGroupLane(x.lane) && !laneDest(x.lane))) return;
+    if (voter !== "owner" && !PERSON_JID.test(String(voter))) return;
+    const same = (a, b) => [...a].sort().join("\u0000") === [...b].sort().join("\u0000");
+    if (same(x.votes[voter] ?? [], options)) return; // the same vote again (it can arrive as an upsert and as an update): nothing changes, nothing is told
+    if (options.length) x.votes[voter] = options; else delete x.votes[voter];
+    if (x.own && owner === true) {
+      if (S.notes[x.lane]) S.notes[x.lane] = S.notes[x.lane].filter((nt) => !(nt.k === "poll-result" && nt.id === pollId));
+      return enqueue(x.lane, pollResultLine(x.ref, x.options, x.votes), null, isGroupLane(x.lane) ? { fromOwner: true } : {});
+    }
+    addNote(x.lane, { k: "poll-result", id: pollId }, `r:${pollId}`);
+  }
+  async function onVote({ pollId, options, voter, owner }) {
+    if (!S.polls[pollId]) return voteOnPoll(pollId, options, voter, owner);
     const p = S.polls[pollId], head = S.queue[0];
     if (!p || !head || head.id !== p.qid || head.cursor !== p.cursor) return log("vote for a poll that is not the head question");
     if (options === null) return sendOnce(`unreadable:${pollId}:${now()}`, POLL_UNREADABLE); // keeps the question at the head
     if (!options.length) return;
     return answerHead(options.join(", "), options.join(", "));
+  }
+
+  // A poll someone created in a group without addressing Gremio: kept (for its votes) and shown on the lane's next turn. Only a lane that a
+  // gated message already made: this never registers a group.
+  async function onSeen(n) {
+    const g = n.group, id = groupLaneId(g?.jid);
+    if (!id || !n.poll || !S.groups[id] || S.groups[id].jid !== g.jid || !laneDest(id) || S.xpolls[n.id]) return;
+    addPerson(S, id, g.jids, g.name);
+    const ref = refIn(id, g.quote?.key, { text: n.poll.question, kind: "poll" });
+    keepPoll(id, n, ref);
+    addNote(id, { k: "poll-new", id: n.id }, `p:${n.id}`);
+  }
+  // A reaction to a message: shown on the lane's next turn only when the message is one Gremio sent in that lane. Never a turn of its own.
+  async function onReaction(ev) {
+    const id = ev.chat ? groupLaneId(ev.chat) : "chat";
+    if (!id || !S.lanes[id] || (ev.chat && (S.groups[id]?.jid !== ev.chat || !laneDest(id)))) return;
+    const rec = findMsg(S, id, ev.id);
+    if (!rec?.mine) return;
+    const who = ev.owner ? "owner" : ev.jids.map((j) => personName(S, id, j)).find(Boolean) ?? maskJid(ev.jids[0] ?? "");
+    addNote(id, { k: "react", name: who, emoji: isEmojiOrEmpty(ev.emoji) ? ev.emoji : "(reaksi)", ref: rec.ref }, `${ev.jids[0] ?? "owner"}|${ev.id}`);
   }
 
   // ---- /status: how long a running turn has run and its last guarded action, asked of the runner (it alone knows) ----
@@ -431,6 +531,164 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       lines.push(`pertanyaan antre: ${S.queue.length}`, `hari ini: ${u.turns ?? 0} turn, in ${u.input ?? 0}, out ${u.output ?? 0}, cache read ${u.cache_read ?? 0}`);
       return sendOnce(`cmd:${now()}`, lines.join("\n"));
     }
+  }
+
+  // ---- the actions of a normal user (PLAN 2.14) ----
+  // The runner forwards a model's tool call as {ev: "wa-action", rid, lane, action, args}; the lane comes from the token the runner
+  // checked. The model never names a destination: it is the lane's own (the owner for chat and task lanes, that group for a group lane),
+  // and a message is named by a ref of this lane's table. At most 6 actions per lane per minute and 30 per hour, counted on acceptance.
+  const limiter = rateLimiter(now);
+  const OUTBOX = join(xchg, "sock", "outbox"), INBOX = join(xchg, "inbox");
+  const fail = (msg) => { throw new Error(msg); };
+  const keyOf = (it) => (it.mine ? { id: it.id, fromMe: true, ...(it.chat ? { remoteJid: it.chat } : {}) } : { id: it.id, remoteJid: it.chat, ...(it.from ? { participant: it.from } : {}), fromMe: false });
+  const textArg = (v, what = "text") => { const t = String(v ?? "").trim(); if (!t || t.length > MAX_TEXT) fail(`${what} must be 1 to ${MAX_TEXT} characters`); return t; };
+  const escapeRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  // A ref of this lane, in this lane's chat.
+  function needRef(lane, ref, to) {
+    const it = findRef(S, lane, ref);
+    if (!it) fail("unknown ref: use one from a message tag of this chat, like #a1b2");
+    if (to && it.chat !== to.jid) fail("that message is not in this chat");
+    return it;
+  }
+  // The file for wa_send_media: staged by the runner (it reads ~/assistant, which this container cannot see) under its own lane's name, or
+  // a file of /xchg/inbox (a group lane only one that arrived in its own group). The bytes are counted here again.
+  function loadFile(lane, kind, args) {
+    const cap = SEND_CAPS[kind];
+    if (!cap) fail("kind must be image, sticker, document or video");
+    let path, base;
+    if (args.file != null) {
+      const f = String(args.file), parts = f.split(".");
+      if (!(parts.length === 3 && parts[0] === lane && /^[0-9a-f]{16}$/.test(parts[1]) && /^[a-z0-9]{1,8}$/.test(parts[2]))) fail("bad staged file name");
+      path = join(OUTBOX, f); base = String(args.fileName ?? f);
+    } else if (args.inbox != null) {
+      const f = String(args.inbox);
+      if (!/^[\w-]{1,100}(?:\.[A-Za-z0-9]{1,8})?$/.test(f)) fail("bad inbox file name");
+      if (kind === "sticker") fail("a sticker needs a converted image: the runner makes it from a file in ~/assistant");
+      if (isGroupLane(lane) && !refTable(S, lane).items.some((i) => i.file === f)) fail("that file did not arrive in this group");
+      path = join(INBOX, f); base = f;
+    } else fail("no file given");
+    let data;
+    try { data = readCapped(path, cap); } catch (e) { fail(`cannot send that file: ${e.code === "ENOENT" ? "it is not there" : e.message}`); }
+    if (kind === "sticker" && !isWebp(data)) fail("a sticker must be a webp image");
+    return { data, name: basename(base).replace(/[^\w.\- ]/g, "_").slice(0, 100) || "file" };
+  }
+  // A person of this group by display name (or by the ref of one of their messages); one match only.
+  function personFor(lane, name) {
+    const t = refTable(S, lane);
+    if (name.startsWith("#")) {
+      const it = findRef(S, lane, name);
+      if (!it || it.mine || !it.from) fail(`${name} is not a message from a group member`);
+      const j = String(it.from).replace(/:\d+(?=@)/, "");
+      if (!t.people[j]) fail(`${name} is not a member I have seen in this group`); // a quote can name any JID: only people who spoke here
+      return t.people[j].p;
+    }
+    const want = cleanName(name).toLowerCase();
+    const hits = [...new Set(Object.values(t.people).filter((p) => p.n.toLowerCase() === want).map((p) => p.p))];
+    if (hits.length === 1) return hits[0];
+    if (!hits.length) fail(`I have not seen anyone called ${name} in this group (known: ${[...new Set(Object.values(t.people).map((p) => p.n))].slice(0, 15).join(", ") || "nobody yet"})`);
+    fail(`more than one person is called ${name} in this group: use the ref of one of their messages instead`);
+  }
+
+  async function runAction(m) {
+    const lane = typeof m.lane === "string" ? m.lane : "", args = m.args && typeof m.args === "object" ? m.args : {};
+    if (!known(lane)) fail("unknown lane");
+    const group = isGroupLane(lane), to = group ? laneDest(lane) : null;
+    if (group && !to) fail("this group is not allowed any more");
+    if (wa.isOpen?.() === false) fail("WhatsApp is not connected right now");
+    const lim = limiter.take(lane);
+    if (!lim.ok) fail(`rate limit: at most 6 actions per minute and 30 per hour in a chat; try again in ${lim.waitS} s`);
+    const o = group ? { jid: to.jid } : {};
+    const id = messageId(`act:${m.rid}`);
+    const shown = () => { cancelAck(lane); cancelReact(lane); }; // a visible action answers the message: no 👀 or progress line after it
+    const sent = (text, kind = "text") => { const it = recordSent(lane, id, text, to?.jid ?? null, kind); save(); return { ref: `#${it.ref}` }; };
+    switch (m.action) {
+      case "react": {
+        if (!isEmojiOrEmpty(args.emoji)) fail("emoji must be exactly one emoji, or an empty string to take the reaction back");
+        await wa.reactAny(keyOf(needRef(lane, args.ref, to)), args.emoji, o);
+        shown();
+        return {};
+      }
+      case "reply": {
+        const text = textArg(args.text), it = needRef(lane, args.ref, to);
+        const r = sent(text);
+        await wa.reply(text, { key: keyOf(it), message: { conversation: it.text ?? "" } }, { ...o, id });
+        shown();
+        return r;
+      }
+      case "media": {
+        const kind = String(args.kind ?? "");
+        const caption = args.caption == null || kind === "sticker" ? "" : String(args.caption).trim();
+        if (caption.length > 1000) fail("caption must be at most 1000 characters");
+        const { data, name } = loadFile(lane, kind, args);
+        const r = sent(caption || `[${kind}]`, "media");
+        await wa.sendMedia({ kind, data, mimetype: mimeOf(kind, name), fileName: name, caption }, { ...o, id });
+        shown();
+        return r;
+      }
+      case "poll": {
+        const question = String(args.question ?? "").trim();
+        const options = (Array.isArray(args.options) ? args.options : []).map((x) => String(x ?? "").trim());
+        if (!question || question.length > 250) fail("question must be 1 to 250 characters");
+        if (options.length < 2 || options.length > POLL_MAX_OPTIONS || options.some((x) => !x || x.length > 100)) fail(`a poll needs 2 to ${POLL_MAX_OPTIONS} options of 1 to 100 characters`);
+        if (new Set(options.map((x) => x.toLowerCase())).size !== options.length) fail("the options must all be different");
+        const multi = args.multi === true;
+        const p = await wa.sendPoll(question, options, { ...o, id, multi });
+        const r = sent(question, "poll");
+        S.xpolls[p.id] = { raw: p.raw, lane, ref: r.ref.slice(1), question, options, own: true, multi, votes: {}, ts: now() }; // votes come back as events (voteOnPoll)
+        shown();
+        save();
+        return r;
+      }
+      case "mention": {
+        if (!group) fail("wa_mention works in a group chat only");
+        let text = textArg(args.text);
+        const names = [...new Set((Array.isArray(args.names) ? args.names : []).map((x) => String(x ?? "").trim().replace(/^@(?=[^#])/, "")).filter(Boolean))].slice(0, 10);
+        if (!names.length) fail("names must list at least one person");
+        const jids = [];
+        for (const name of names.sort((x, y) => y.length - x.length)) { // longest first: "@Budi Santoso" before "@Budi"
+          const jid = personFor(lane, name), token = `@${name}`;
+          if (!text.toLowerCase().includes(token.toLowerCase())) fail(`the text must contain ${token}`);
+          text = text.replace(new RegExp(escapeRe(token), "gi"), `@${jid.split("@")[0]}`);
+          jids.push(jid);
+        }
+        const r = sent(text);
+        await wa.sendMention(text, [...new Set(jids)], { ...o, id });
+        shown();
+        return r;
+      }
+      case "edit": {
+        const text = textArg(args.text), it = needRef(lane, args.ref, to);
+        if (!it.mine) fail("I can only edit messages I sent myself");
+        if (it.kind !== "text") fail("only a plain text message can be edited");
+        if (now() - (it.ts ?? 0) > EDIT_WINDOW_MS) fail("WhatsApp only allows an edit within 15 minutes of sending");
+        await wa.edit(it.id, text, o);
+        it.text = text.slice(0, 200);
+        save();
+        return {};
+      }
+      case "delete": {
+        const it = needRef(lane, args.ref, to);
+        if (!it.mine) fail("I can only delete messages I sent myself");
+        await wa.remove(it.id, o);
+        const t = refTable(S, lane);
+        t.items = t.items.filter((i) => i !== it);
+        save();
+        return {};
+      }
+      default: return fail(`unknown action ${String(m.action).slice(0, 30)}`);
+    }
+  }
+  async function doAction(m) {
+    const reply = (r) => toRunner({ op: "wa-result", rid: String(m.rid ?? "").slice(0, 64), ...r });
+    let timer;
+    try {
+      const r = await Promise.race([runAction(m), new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("WhatsApp did not confirm in time")), actionMs); timer.unref?.(); })]);
+      reply({ ok: true, ...r });
+    } catch (e) {
+      log(`wa action ${String(m.action).slice(0, 20)} refused or failed: ${e.message}`);
+      reply({ ok: false, error: e.message });
+    } finally { clearTimeout(timer); }
   }
 
   // ---- events from the runner (everything in `m` is untrusted input: ids are checked before they key or name anything) ----
@@ -557,7 +815,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       else log(`rejected deferred tool ${String(m.deferred.name).slice(0, 40)} id ${String(m.deferred.id).slice(0, 40)}`);
     }
     if (L.done && !L.queue.length && !hasQuestion(m.lane)) {
-      delete S.lanes[m.lane]; delete S.sessions[m.lane]; delete S.tasks[m.lane];
+      delete S.lanes[m.lane]; delete S.sessions[m.lane]; delete S.tasks[m.lane]; delete S.refs[m.lane]; delete S.notes[m.lane];
       save();
       return showHead();
     }
@@ -570,7 +828,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   const runnerEvent = serial(onRunnerEvent);
   return {
     state: S,
-    onMessage: serial(onMessage), onVote: serial(onVote), onRunnerEvent: (m) => { if (m?.ev === "status") { onStatusReply(m); return Promise.resolve(); } if (m?.ev === "ack-text") { onAckTextReply(m); return Promise.resolve(); } return runnerEvent(m); }, showHead: serial(showHead),
+    onMessage: serial(onMessage), onVote: serial(onVote), onRunnerEvent: (m) => { if (m?.ev === "status") { onStatusReply(m); return Promise.resolve(); } if (m?.ev === "ack-text") { onAckTextReply(m); return Promise.resolve(); } if (m?.ev === "wa-action") return doAction(m); return runnerEvent(m); }, onSeen: serial(onSeen), onReaction: serial(onReaction), showHead: serial(showHead),
     flushPending: serial(flushPending),
     onOpen: serial(async () => { if (!S.pairedAt) { S.pairedAt = now(); save(); } return flushPending(); }),
     onRunnerDown() { runnerUp = false; },
@@ -606,12 +864,12 @@ async function main() {
   const groups = parseGroups(env.WA_GROUP_JIDS); // family groups: any member may address Gremio there (PLAN 2.13)
   let conn = null, core = null;
   const toRunner = (m) => send(conn, m);
-  const polls = { get: (id) => state.d.polls[id]?.raw };
+  const polls = { get: (id) => state.d.polls[id]?.raw ?? state.d.xpolls[id]?.raw }; // question polls, Gremio's own polls and polls others made
   const wa = createWa({
     lib, owners: parseOwners(owner), groups, ownerJid: owner.split(",")[0], authDir: join(dir, "auth"), xchg, polls,
     logger: pino({ level: env.WA_LOG_LEVEL ?? "warn" }), agent,
     fetchVersion: env.WA_FETCH_VERSION !== "0", qr: (q) => qrt.generate(q, { small: true }), log,
-    onMessage: (n) => core.onMessage(n), onVote: (v) => core.onVote(v), onOpen: () => core.onOpen(),
+    onMessage: (n) => core.onMessage(n), onVote: (v) => core.onVote(v), onSeen: (n) => core.onSeen(n), onReaction: (r) => core.onReaction(r), onOpen: () => core.onOpen(),
   });
   core = createCore({ state, xchg, wa, toRunner, groups, log });
   const health = createHealth({ url: env.PING_BRIDGE_URL, isOpen: () => wa.isOpen(), get: (u) => httpGet(u, { agent }), log });

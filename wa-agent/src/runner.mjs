@@ -7,21 +7,24 @@
 import net from "node:net";
 import { spawn as nodeSpawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, existsSync, fstatSync } from "node:fs";
+import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, existsSync, fstatSync } from "node:fs";
 import { setPriority } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { LineSplitter, parseLine, pickResult } from "./stream.mjs";
 import { attach, send } from "./ipc.mjs";
 import { resetPolicy } from "./reset.mjs";
 import { inside, isGroupLane, validFile, validId } from "./ids.mjs";
 import { ACK_TRIGGER_MAX, REACT_TRIGGER_MAX, generateAck, generateReactEmoji } from "./ack.mjs";
+import { SEND_CAPS, readCapped } from "./wa-actions.mjs";
 
 const CODE_RE = /^[a-z0-9]{3,8}-[0-9]{3,6}$/i;
 
 // D20 (PLAN 2.5, section 8: three lanes peaked at 482 MiB anon+kernel, 786 MiB with margin against 700): one task lane by
 // default. WA_MAX_TASK_LANES may raise it to 2; any other value means 1.
 export const maxTaskLanes = (v) => (v === "2" ? 2 : 1);
+// Tool ops that act on WhatsApp as a person would; the value is the action name the bridge knows.
+const WA_OPS = Object.assign(Object.create(null), { wa_react: "react", wa_reply: "reply", wa_send_media: "media", wa_poll: "poll", wa_mention: "mention", wa_edit: "edit", wa_delete: "delete" }); // no prototype: m.op is the tool's word
 const MAX_GROUP_TRACKED = 20; // issues one group lane keeps tracked at a time
 const MAX_BUFFER = 500; // events kept for a bridge that is away
 const VIDEO_FRAMES = 4;
@@ -284,12 +287,96 @@ export function createRunner(opts) {
     saveReg();
   }
 
+  // ---- the actions of a normal user (PLAN 2.14): react, reply, media, poll, mention, edit, delete ----
+  // The tool's request goes to the bridge as `wa-action` (never buffered: a stale action must not run after a reconnect) with the lane the
+  // token proves; the bridge picks the destination, validates the refs and answers `wa-result`. Media is read here: ~/assistant is not
+  // mounted in the bridge container, so the runner checks the path, counts the bytes, converts a sticker and stages the file for it.
+  const WA_OUT = join(xchg, "sock", "outbox");
+  const pendingWa = new Map(); // wa-action id -> {sock, rid, timer, cleanup}
+  function finishWa(wid, r) {
+    const p = pendingWa.get(wid);
+    if (!p) return;
+    pendingWa.delete(wid);
+    clearTimeout(p.timer);
+    p.cleanup();
+    send(p.sock, { ev: "reply", rid: p.rid, ...r });
+  }
+  function makeSticker(src, dest) {
+    return new Promise((res) => {
+      let p;
+      const vf = "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000,format=rgba";
+      try { p = spawn("ffmpeg", ["-nostdin", "-v", "error", "-y", "-protocol_whitelist", "file", "-i", src, "-vf", vf, "-frames:v", "1", "-c:v", "libwebp", "-lossless", "0", "-q:v", "70", dest], { env: { PATH: srcEnv.PATH }, stdio: "ignore", timeout: opts.ffmpegTimeoutMs ?? 60000, killSignal: "SIGKILL" }); } catch { return res(false); }
+      try { setPriority(p.pid, 19); } catch { /* not started, or not allowed */ }
+      p.on("error", () => res(false));
+      p.on("close", (code) => res(code === 0));
+    });
+  }
+  // Returns {args, cleanup}: args for the bridge ({kind, caption, file | inbox, fileName}). Throws a message the model can read.
+  async function prepareMedia(lane, m) {
+    const kind = String(m.kind ?? "");
+    if (!SEND_CAPS[kind]) throw new Error("kind must be image, sticker, document or video");
+    const cap = SEND_CAPS[kind], group = isGroupLane(lane);
+    const raw = String(m.path ?? "").trim();
+    if (!raw) throw new Error("path is required");
+    let real;
+    try { real = realpathSync(raw.startsWith("~/") ? join(home, raw.slice(2)) : resolve(laneCwd(lane), raw)); } catch { throw new Error("no such file"); }
+    const under = (p, root) => !!root && p.startsWith(root + sep);
+    const root = (d) => { try { return realpathSync(d); } catch { return null; } };
+    const own = group ? root(join(home, "assistant", "groups", lane.slice("grp_".length))) : root(join(home, "assistant"));
+    const inbox = root(join(xchg, "inbox"));
+    const fromInbox = under(real, inbox), fromHome = under(real, own);
+    if (!fromInbox && !fromHome) throw new Error(group ? "a group chat can send files only from its own folder ~/assistant/groups/<id> or ones that arrived in that group" : "path must be under ~/assistant or /xchg/inbox");
+    const caption = m.caption == null ? "" : String(m.caption);
+    const base = { kind, ...(caption ? { caption } : {}), fileName: basename(real) };
+    if (fromInbox && kind !== "sticker") { // the bridge owns the inbox: it reads the file itself (and, for a group, checks it arrived there)
+      if (dirname(real) !== inbox) throw new Error("path must be directly in /xchg/inbox");
+      return { args: { ...base, inbox: basename(real) }, cleanup: () => {} };
+    }
+    if (fromInbox && group) throw new Error("a sticker in a group chat must come from the group's own folder");
+    const data = readCapped(real, cap); // counts the bytes it reads; a symlink in the last place is refused
+    mkdirSync(WA_OUT, { recursive: true, mode: 0o755 });
+    const stem = join(WA_OUT, `${lane}.${randomBytes(8).toString("hex")}`);
+    const ext = (basename(real).match(/\.([A-Za-z0-9]{1,8})$/)?.[1] ?? "bin").toLowerCase();
+    const made = [];
+    const cleanup = () => { for (const f of made) rmSync(f, { force: true }); };
+    try {
+      if (kind === "sticker") {
+        const src = `${stem}.in.${ext}`; // the capped bytes we read, not the path the model named
+        writeFileSync(src, data, { flag: "wx", mode: 0o644 });
+        made.push(src, `${stem}.webp`);
+        if (!(await makeSticker(src, `${stem}.webp`))) throw new Error("could not turn that image into a sticker (is it an image? is ffmpeg installed?)");
+        readCapped(`${stem}.webp`, cap);
+        return { args: { ...base, file: basename(`${stem}.webp`) }, cleanup };
+      }
+      writeFileSync(`${stem}.${ext}`, data, { flag: "wx", mode: 0o644 });
+      made.push(`${stem}.${ext}`);
+      return { args: { ...base, file: basename(`${stem}.${ext}`) }, cleanup };
+    } catch (e) { cleanup(); throw e; }
+  }
+  async function waAction(sock, m, lane) {
+    const fail = (error) => send(sock, { ev: "reply", rid: m.rid, ok: false, error });
+    if (!bridgeLive()) return fail("the WhatsApp bridge is not connected right now; try again in a moment");
+    let prep;
+    try {
+      const s = (v) => (typeof v === "string" ? v : undefined);
+      prep = m.op === "wa_send_media" ? await prepareMedia(lane, m)
+        : { cleanup: () => {}, args: { ref: s(m.ref), text: s(m.text), emoji: s(m.emoji), question: s(m.question), options: Array.isArray(m.options) ? m.options.map(String) : undefined, names: Array.isArray(m.names) ? m.names.map(String) : undefined, multi: m.multi === true } };
+    } catch (e) { return fail(e.message); }
+    if (!bridgeLive()) { prep.cleanup(); return fail("the WhatsApp bridge is not connected right now; try again in a moment"); }
+    const wid = randomBytes(12).toString("hex");
+    const timer = setTimeout(() => finishWa(wid, { ok: false, error: "the bridge did not answer in time" }), opts.waActionMs ?? 90000);
+    pendingWa.set(wid, { sock, rid: m.rid, timer, cleanup: prep.cleanup });
+    sock.once("close", () => { const p = pendingWa.get(wid); if (p) { pendingWa.delete(wid); clearTimeout(p.timer); p.cleanup(); } });
+    send(bridge, { ev: "wa-action", rid: wid, lane, action: WA_OPS[m.op], args: prep.args });
+  }
+
   function handleTool(sock, m, who) {
     const reply = (obj) => send(sock, { ev: "reply", rid: m.rid, ...obj });
     const lane = who.lane;
     // A group lane talks to its group in plain text. Everything that would reach the owner, his queue, a code or the wiki is closed.
     // start_task and track_issue stay open to it, and both check that the turn was started by the owner himself.
-    if (isGroupLane(lane) && m.op !== "start_task" && m.op !== "track_issue") return reply({ ok: false, error: `${m.op} is not available in a group chat: answer in plain text` });
+    if (isGroupLane(lane) && m.op !== "start_task" && m.op !== "track_issue" && !WA_OPS[m.op]) return reply({ ok: false, error: `${m.op} is not available in a group chat: answer in plain text` });
+    if (WA_OPS[m.op]) return void waAction(sock, m, lane);
     switch (m.op) {
       case "start_task": {
         if (!projectId) return reply({ ok: false, error: "start_task is disabled: WA_GREMIO_PROJECT_ID is not set. Do the task inline in this chat lane, without an issue." });
@@ -467,7 +554,7 @@ export function createRunner(opts) {
         if (!authenticateBridge(sock, who, m)) return refuse("bridge proof failed");
         who.role = "bridge";
         bridge = sock;
-        sock.on("close", () => { if (bridge === sock) bridge = null; });
+        sock.on("close", () => { if (bridge === sock) { bridge = null; for (const wid of [...pendingWa.keys()]) finishWa(wid, { ok: false, error: "the WhatsApp bridge disconnected before it answered; the action may not have been sent" }); } });
         const buffered = [...new Set(buffer.filter((e) => e.ev === "result").map((e) => e.lane))];
         send(sock, { ev: "hello", busy: [...lanes.keys()], tasks: activeTasks(), buffered });
         const replay = buffer; buffer = [];
@@ -505,6 +592,10 @@ export function createRunner(opts) {
         return void generateAck({ baseUrl: srcEnv.ANTHROPIC_BASE_URL, ...ackCred, model: ackModel, trigger: typeof m.text === "string" ? m.text.slice(0, ACK_TRIGGER_MAX) : "", last: lastAction(e.sessionId), timeoutMs: opts.ackHttpMs, failed: (why) => log(`ack text: ${why}`) })
           .then((text) => send(sock, { ev: "ack-text", id, text }));
       }
+      case "wa-result": { // the bridge's answer to a wa-action: tell the tool that asked
+        const { rid, ...r } = m;
+        return finishWa(String(rid ?? ""), { ok: r.ok === true, ...(r.ok === true ? { ref: typeof r.ref === "string" ? r.ref : undefined } : { error: String(r.error ?? "failed").slice(0, 300) }) });
+      }
       case "ack": if (validFile(m.file)) { try { unlinkSync(inside(join(xchg, "events"), m.file)); } catch { /* gone */ } } return;
       case "grant-ack": {
         const g = reg.guard;
@@ -536,6 +627,7 @@ export function createRunner(opts) {
     runTurn,
     async listen() {
       mkdirSync(dirname(sockPath), { recursive: true });
+      rmSync(WA_OUT, { recursive: true, force: true }); // staged media of a previous run
       try { unlinkSync(sockPath); } catch { /* none */ }
       server = net.createServer(onConnection);
       // Resume from the saved offset (a restart must not skip or repeat lines); the first run starts at the end. Never reset per turn.
