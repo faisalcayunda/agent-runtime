@@ -7,7 +7,7 @@ import http from "node:http";
 import { existsSync, lstatSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as baileys from "@whiskeysockets/baileys";
-import { ProxyAgent, createWa, decodeVote, isOwnerMessage, messageId, normalizeMessage, parseOwners } from "../src/wa.mjs";
+import { ProxyAgent, createWa, decodeVote, groupGate, isOwnerMessage, messageId, normalizeMessage, parseGroups, parseOwners, quotedOf } from "../src/wa.mjs";
 import { sandbox, waitFor } from "../testlib/helpers.mjs";
 
 const OWNER = "628111@s.whatsapp.net";
@@ -65,6 +65,7 @@ function fakeLib() {
         ev: { on: (n, f) => { handlers[n] = f; } },
         sendMessage: async (jid, content, opts) => { sent.push({ jid, content, opts }); return { key: { id: opts?.messageId ?? "WAID" }, message: { pollCreationMessage: { name: "q" }, messageContextInfo: { messageSecret: Buffer.from("0123456789abcdef0123456789abcdef") } } }; },
         sendPresenceUpdate: async (p, jid) => { sent.push({ presence: p, jid }); },
+        groupFetchAllParticipating: async () => ({ "120363@g.us": { id: "120363@g.us", subject: "Home Sweet Home", participants: [{ id: "628222@s.whatsapp.net" }] }, "120999@g.us": { id: "120999@g.us", subject: "Kantor" } }),
         signalRepository: { lidMapping: { getPNForLID: async (l) => (l === "555@lid" ? OWNER : null) } },
       };
       sockets.push(sock);
@@ -199,4 +200,158 @@ test("a vote event reaches onVote with the decoded labels, or null when it canno
   assert.deepEqual(got.votes[1], { pollId: "P1", options: null });
   await up({ type: "notify", messages: [{ key: { id: "V3", remoteJid: "628222@s.whatsapp.net" }, messageTimestamp: 3, message: { pollUpdateMessage: vote("P1").pollUpdate } }] }); // a stranger's vote
   assert.equal(got.votes.length, 2);
+});
+
+// ---------- family group lane and other groups (PLAN 2.13) ----------
+const FAM = "120363@g.us", OTHER = "120999@g.us", MEMBER = "628222@s.whatsapp.net";
+const SELF = new Set(["99@s.whatsapp.net", "77@lid"]);
+const gm = (key, text = "halo semua", ctx = null, extra = {}) => ({
+  key: { id: "G1", remoteJid: FAM, participant: MEMBER, ...key }, pushName: "Budi", messageTimestamp: 1_800_000_000, ...extra,
+  message: ctx ? { extendedTextMessage: { text, contextInfo: ctx } } : { conversation: text },
+});
+const gate = (msg, family = new Set([FAM])) => groupGate(msg, { owners, family, self: SELF });
+
+test("parseGroups keeps only well-formed group JIDs", () => {
+  assert.deepEqual([...parseGroups(" 120363@g.us, 628111-1600000000@g.us ,bad,628@s.whatsapp.net,,x@g.us")], ["120363@g.us", "628111-1600000000@g.us"]);
+  assert.equal(parseGroups("").size, 0);
+  assert.equal(parseGroups(undefined).size, 0);
+});
+
+test("group gate: a family message passes only when it addresses Gremio (mention, reply to Gremio, 'gremio' prefix)", () => {
+  assert.equal(gate(gm({}, "halo semua")), null);                                               // chatter: ignored
+  assert.equal(gate(gm({}, "halo semua", { mentionedJid: ["628333@s.whatsapp.net"] })), null);  // mentions someone else
+  assert.equal(gate(gm({}, "tanya dulu gremio", {})), null);                                    // not a prefix
+  assert.equal(gate(gm({}, "gremiox halo")), null);                                              // word boundary
+  assert.equal(gate(gm({}, "x", { participant: MEMBER, stanzaId: "ABC123" })), null);           // reply to a member
+  const pass = (msg) => assert.deepEqual(gate(msg), { jid: FAM, fromOwner: false, family: true });
+  pass(gm({}, "@99 tolong", { mentionedJid: ["99@s.whatsapp.net"] }));                            // mention by phone JID
+  pass(gm({}, "@77 tolong", { mentionedJid: ["628333@s.whatsapp.net", "77@lid"] }));             // mention by LID
+  pass(gm({}, "oke", { participant: "99@s.whatsapp.net", stanzaId: "ABC123" }));                  // reply to Gremio (its own JID)
+  pass(gm({}, "oke", { participant: "77@lid", stanzaId: "ABC123" }));                             // reply to Gremio (its LID)
+  pass(gm({}, "oke", { stanzaId: messageId("t:k1") }));                                           // reply to an id the bridge generated
+  pass(gm({}, "Gremio, tolong cek"));
+  pass(gm({}, "  GREMIO tolong"));
+  pass({ ...gm({}, "gremio"), message: { imageMessage: { caption: "gremio ini apa", contextInfo: {} } } }); // caption counts as text
+});
+
+test("group gate: other groups pass the owner only, matched by phone JID, LID or LID twin", () => {
+  const to = (key, text = "gremio cek") => gm({ remoteJid: OTHER, ...key }, text);
+  assert.equal(gate(to({})), null);                                                          // a member addressing Gremio in another group
+  assert.equal(gate(to({ participant: OWNER }, "halo semua")), null);                         // the owner not addressing Gremio
+  assert.deepEqual(gate(to({ participant: OWNER })), { jid: OTHER, fromOwner: true, family: false });
+  assert.equal(gate(to({ participant: "628111:7@s.whatsapp.net" }))?.fromOwner, true);       // device suffix
+  assert.equal(gate(to({ participant: "999@lid" }))?.fromOwner, true);                        // learned owner LID
+  assert.equal(gate(to({ participant: "555@lid", participantAlt: OWNER }))?.fromOwner, true); // unknown LID, phone twin is the owner
+  assert.equal(gate(to({ participant: "555@lid", participantAlt: MEMBER })), null);
+  assert.equal(gate(to({ participant: "628111@lid" })), null);                                // same digits, other server
+  assert.equal(gate(gm({ remoteJid: OTHER, participant: OWNER }, "x", { mentionedJid: ["99@s.whatsapp.net"] }))?.fromOwner, true);
+  assert.equal(gate(gm({ participant: OWNER }, "gremio hi"))?.fromOwner, true);               // the owner in the family group keeps the flag
+});
+
+test("group gate: never a DM, a broadcast, an echo of Gremio or a missing sender", () => {
+  assert.equal(gate(gm({ remoteJid: OWNER, participant: undefined }, "gremio hi")), null);   // 1:1 chats are the owner gate's job
+  assert.equal(gate(gm({ remoteJid: "status@broadcast" }, "gremio hi")), null);
+  assert.equal(gate(gm({ fromMe: true }, "gremio hi")), null);
+  assert.equal(gate(null), null);
+  assert.equal(gate(gm({ participant: undefined }, "gremio hi"))?.fromOwner, false);          // no sender: a member, never the owner
+});
+
+test("upsert: group messages reach the bridge only through the gate, and nothing about them is logged", async () => {
+  const S = sandbox();
+  const logs = [];
+  const { F, got } = await startWa(S, { groups: new Set([FAM]), log: (l) => logs.push(l) });
+  logs.length = 0;
+  const up = F.handlers["messages.upsert"];
+  await up({ type: "notify", messages: [
+    gm({ id: "u1" }, "halo semua"),                                                      // family chatter
+    gm({ id: "u2", remoteJid: OTHER }, "gremio cek"),                                    // member of another group addressing Gremio
+    gm({ id: "u3", remoteJid: OTHER, participant: OWNER }, "ngobrol biasa"),             // the owner, not addressing Gremio
+    gm({ id: "u4", remoteJid: "120777@g.us", participant: MEMBER }, "gremio cek"),       // unknown group
+    gm({ id: "u5" }, "gremio cek"),                                                      // family, addressed
+    gm({ id: "u6", remoteJid: OTHER, participant: OWNER }, "gremio cek"),                // owner, other group, addressed
+    gm({ id: "u7", remoteJid: "628222@s.whatsapp.net", participant: undefined }, "gremio cek"), // DM from a stranger
+  ] });
+  assert.deepEqual(got.messages.map((x) => x.id), ["u5", "u6"]);
+  assert.deepEqual(got.messages[0].group, { jid: FAM, fromOwner: false, family: true, name: "Budi", quote: { key: { id: "u5", remoteJid: FAM, participant: MEMBER }, message: { conversation: "gremio cek" } } });
+  assert.equal(got.messages[1].group.fromOwner, true);
+  assert.equal(got.messages[1].group.family, false);
+  assert.deepEqual(logs.filter((l) => /g\.us|group|grup/i.test(l)), []);               // no group log line at all
+  assert.equal(logs.filter((l) => /dropped message from/.test(l)).length, 1);            // only the stranger's DM
+});
+
+test("upsert: the display name falls back to a masked number, and a group voice note is not downloaded", async () => {
+  const S = sandbox();
+  const { F, got } = await startWa(S, { groups: new Set([FAM]) });
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [
+    gm({ id: "n1", participant: "628123456789@s.whatsapp.net" }, "gremio hi", null, { pushName: undefined }),
+    { ...gm({ id: "n2" }, ""), message: { imageMessage: { caption: "gremio ini apa", mimetype: "image/jpeg" } } },
+  ] });
+  assert.equal(got.messages[0].group.name, "********6789");
+  assert.equal(got.messages[1].files, undefined); // media from a group is not saved to /xchg/inbox
+  assert.deepEqual(readdirSync(join(S.xchg, "inbox")), []);
+});
+
+test("upsert: a group message from an unknown owner LID learns it before the gate", async () => {
+  const S = sandbox();
+  const { F, got } = await startWa(S, { groups: new Set() });
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [gm({ id: "l1", remoteJid: OTHER, participant: "555@lid" }, "gremio cek")] });
+  assert.deepEqual(got.messages.map((x) => x.id), ["l1"]); // 555@lid maps to the owner phone JID in the fake store
+  assert.equal(got.messages[0].group.fromOwner, true);
+});
+
+test("sendGroup sends to a group JID only, quoted; sendText still has no recipient", async () => {
+  const S = sandbox();
+  const { F, wa } = await startWa(S, { groups: new Set([FAM]) });
+  const quote = { key: { id: "Q1", remoteJid: FAM, participant: MEMBER }, message: { conversation: "gremio cek" } };
+  await wa.sendGroup(FAM, "halo", { id: messageId("k"), quote });
+  await wa.sendGroup(OTHER, "ke grup lain", { id: messageId("k2") });
+  await assert.rejects(() => wa.sendGroup(OWNER, "dm", {}), /not a group/);
+  await assert.rejects(() => wa.sendGroup("628222@s.whatsapp.net", "dm", {}), /not a group/);
+  assert.deepEqual(F.sent.map((s) => s.jid), [FAM, OTHER]);
+  assert.equal(F.sent[0].opts.quoted, quote);
+  assert.equal(F.sent[0].opts.messageId, messageId("k"));
+  await wa.sendText("masih ke owner", { jid: FAM });
+  assert.equal(F.sent[2].jid, OWNER);
+});
+
+test("on connect, with WA_GROUP_JIDS empty the groups of the account are listed, one line each; with it set, nothing", async () => {
+  const S = sandbox();
+  const logs = [];
+  const { F } = await startWa(S, { groups: new Set(), log: (l) => logs.push(l) });
+  await waitFor(() => logs.filter((l) => /Home Sweet Home|Kantor/.test(l)).length === 2);
+  assert.deepEqual(logs.filter((l) => /g\.us/.test(l)).sort(), ["group: Home Sweet Home 120363@g.us", "group: Kantor 120999@g.us"]);
+  assert.ok(!logs.join("\n").includes("628222")); // no member numbers
+  const logs2 = [];
+  await startWa(sandbox(), { groups: new Set([FAM]), log: (l) => logs2.push(l) });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(logs2.filter((l) => /group|g\.us/i.test(l)), []);
+});
+
+test("quotedOf reads text, extended text, captions and names media; caps long text; names the author", () => {
+  const q = (quotedMessage, participant = MEMBER) => gm({}, "gremio jelasin", { quotedMessage, participant, stanzaId: "S1" });
+  const opt = { self: SELF, owners };
+  assert.deepEqual(quotedOf(q({ conversation: "laptopnya lemot" }), opt), { author: "**8222", text: "laptopnya lemot" });
+  assert.equal(quotedOf(q({ extendedTextMessage: { text: "panjang" } }), opt).text, "panjang");
+  assert.deepEqual(quotedOf(q({ imageMessage: { caption: "ini errornya", mimetype: "image/jpeg" } }), opt).text, "[media: image] ini errornya");
+  assert.equal(quotedOf(q({ videoMessage: {} }), opt).text, "[media: video]");
+  assert.equal(quotedOf(q({ documentWithCaptionMessage: { message: { documentMessage: { caption: "laporan" } } } }), opt).text, "[media: document] laporan");
+  assert.equal(quotedOf(q({ conversation: "x" }, "99:1@s.whatsapp.net"), opt).author, "Gremio");
+  assert.equal(quotedOf(q({ conversation: "x" }, OWNER), opt).author, "owner");
+  assert.equal(quotedOf(q({ conversation: "x" }, null), opt).author, "?");
+  const long = quotedOf(q({ conversation: "a".repeat(5000) }), opt).text;
+  assert.equal(long.length, 2000);
+  assert.ok(long.endsWith("…"));
+  assert.equal(quotedOf(gm({}, "gremio hi"), opt), null);                                        // not a reply
+  assert.equal(quotedOf(q({ pollCreationMessage: { name: "p" } }), opt), null);                  // nothing readable
+});
+
+test("a reply reaches the bridge with its quoted message, in a group and in the owner's DM; media is not downloaded", async () => {
+  const S = sandbox();
+  const { F, got } = await startWa(S, { groups: new Set([FAM]) });
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [
+    gm({ id: "r1", participant: OWNER }, "@99 jelasin", { mentionedJid: ["99@s.whatsapp.net"], participant: MEMBER, stanzaId: "S1", quotedMessage: { imageMessage: { caption: "ini errornya" } } }),
+    { key: { id: "r2", remoteJid: OWNER }, messageTimestamp: 1_800_000_000, message: { extendedTextMessage: { text: "ok", contextInfo: { participant: "99@s.whatsapp.net", stanzaId: "S2", quotedMessage: { conversation: "PR-nya siap" } } } } },
+  ] });
+  assert.deepEqual(got.messages.map((x) => x.quoted), [{ author: "**8222", text: "[media: image] ini errornya" }, { author: "Gremio", text: "PR-nya siap" }]);
+  assert.deepEqual(readdirSync(join(S.xchg, "inbox")), []);
 });

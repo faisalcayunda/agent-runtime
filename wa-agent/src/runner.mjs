@@ -13,7 +13,7 @@ import { pathToFileURL } from "node:url";
 import { LineSplitter, parseLine, pickResult } from "./stream.mjs";
 import { attach, send } from "./ipc.mjs";
 import { resetPolicy } from "./reset.mjs";
-import { inside, validFile, validId } from "./ids.mjs";
+import { inside, isGroupLane, validFile, validId } from "./ids.mjs";
 
 const CODE_RE = /^[a-z0-9]{3,8}-[0-9]{3,6}$/i;
 
@@ -37,7 +37,7 @@ export const ENV_ALLOWLIST = [
 export function buildEnv(src, { lane, task, token, bgWaitMs = "600000" }) {
   const env = {};
   for (const k of ENV_ALLOWLIST) if (src[k] !== undefined && src[k] !== "") env[k] = src[k];
-  env.WA_LANE = lane === "chat" ? "chat" : "task";
+  env.WA_LANE = lane === "chat" ? "chat" : isGroupLane(lane) ? "group" : "task"; // a group lane is a third kind: it keeps the task lane's limits (PLAN 2.13)
   if (lane !== "chat") env.WA_TASK_ID = String(lane); else delete env.WA_TASK_ID;
   if (token) env.WA_LANE_TOKEN = token; else delete env.WA_LANE_TOKEN; // proves the owner MCP of this lane to the runner
   env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN = "1";
@@ -115,7 +115,7 @@ export function createRunner(opts) {
   }
 
   function laneCwd(lane) {
-    const d = lane === "chat" ? join(home, "assistant") : join(home, "assistant", "tasks", lane);
+    const d = lane === "chat" ? join(home, "assistant") : isGroupLane(lane) ? join(home, "assistant", "groups", lane.slice("grp_".length)) : join(home, "assistant", "tasks", lane);
     mkdirSync(d, { recursive: true });
     return d;
   }
@@ -154,9 +154,10 @@ export function createRunner(opts) {
     const lane = String(req.lane ?? "");
     if (lane !== "chat" && !validId(lane)) return toBridge({ ev: "result", lane, error: "bad lane id" });
     if (lanes.has(lane)) return toBridge({ ev: "busy", lane });
-    const argvFor = (prompt) => buildArgv({ prompt, session: req.session || null, model, mcpConfig: join(agentDir, "config", "mcp.json"), voice: join(agentDir, "config", "voice.md"), permissionMode });
+    const argvFor = (prompt) => buildArgv({ prompt, session: req.session || null, model, mcpConfig: join(agentDir, "config", "mcp.json"), voice: join(agentDir, "config", isGroupLane(lane) ? "voice-group.md" : "voice.md"), permissionMode });
     try { argvFor(req.prompt ?? ""); } catch (e) { return toBridge({ ev: "result", lane, error: e.message }); } // an empty or fable model fails here
-    const entry = { stderr: "", killed: false, proc: null, origin: req.origin ?? null, final: null };
+    // fromOwner: the bridge says whether the one message that started this group turn came from the owner (start_task needs it).
+    const entry = { stderr: "", killed: false, proc: null, origin: req.origin ?? null, final: null, fromOwner: isGroupLane(lane) && req.fromOwner === true };
     lanes.set(lane, entry); // the lane is busy from here on, also while the wiki work below runs
     // A turn with a real prompt (every chat prompt, every task-lane turn that has one) first refreshes the clone and then gets
     // the wiki-retrieve context prepended here. The UserPromptSubmit hook cannot do this: it does not fire on an empty-prompt
@@ -183,7 +184,7 @@ export function createRunner(opts) {
     const handle = (line) => {
       for (const ev of parseLine(line)) {
         if (ev.type === "init" && ev.sessionId) toBridge({ ev: "session", lane, sessionId: ev.sessionId });
-        else if (ev.type === "text" && lane === "chat") toBridge({ ev: "text", lane, text: ev.text, key: ev.key }); // task lanes never forward text
+        else if (ev.type === "text" && (lane === "chat" || isGroupLane(lane))) toBridge({ ev: "text", lane, text: ev.text, key: ev.key }); // task lanes never forward text; a group lane's goes to its group
         else if (ev.type === "tool_result") drainGuardLog(lane);
         else if (ev.type === "result") {
           // Held until the process exits: the lane is busy until then, and a resume sent on `result` would race it.
@@ -222,15 +223,18 @@ export function createRunner(opts) {
   function handleTool(sock, m, who) {
     const reply = (obj) => send(sock, { ev: "reply", rid: m.rid, ...obj });
     const lane = who.lane;
+    // A group lane talks to its group in plain text. Everything that would reach the owner, his queue, a code or the wiki is closed.
+    if (isGroupLane(lane) && m.op !== "start_task") return reply({ ok: false, error: `${m.op} is not available in a group chat: answer in plain text` });
     switch (m.op) {
       case "start_task": {
         if (!projectId) return reply({ ok: false, error: "start_task is disabled: WA_GREMIO_PROJECT_ID is not set. Do the task inline in this chat lane, without an issue." });
-        if (lane !== "chat") return reply({ ok: false, error: "only the chat lane starts tasks" });
+        if (lane !== "chat" && !isGroupLane(lane)) return reply({ ok: false, error: "only the chat lane starts tasks" });
+        if (isGroupLane(lane) && !lanes.get(lane)?.fromOwner) return reply({ ok: false, error: "start_task from a group chat works only when the owner himself sent the message that started this turn. Tell the group you cannot start a task, and that the owner can ask." });
         const issue = String(m.issue ?? "");
-        if (!validId(issue) || issue === "chat") return reply({ ok: false, error: "issue id must be 1-64 characters of letters, digits, - or _" });
+        if (!validId(issue) || issue === "chat" || isGroupLane(issue)) return reply({ ok: false, error: "issue id must be 1-64 characters of letters, digits, - or _" });
         if (reg.lanes[issue] || reg.waiting.includes(issue)) return reply({ ok: true, status: "already" });
         if (activeTasks().length >= MAX_TASK_LANES) { reg.waiting.push(issue); saveReg(); return reply({ ok: true, status: "queued", position: reg.waiting.length }); }
-        startLane(issue, who.origin ?? lanes.get("chat")?.origin ?? null);
+        startLane(issue, isGroupLane(lane) ? null : who.origin ?? lanes.get("chat")?.origin ?? null); // a group-started task borrows no chat message, so no push-main grant
         return reply({ ok: true, status: "started" });
       }
       case "track_issue": {

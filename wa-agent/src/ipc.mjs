@@ -1,5 +1,5 @@
 // Newline-delimited JSON over the runner's unix socket (/xchg/sock/run.sock). Shared by the runner, the bridge
-// and the owner MCP. The protocol has no "send to JID" operation: the bridge sends only to the owner (PLAN 5.1).
+// and the owner MCP. The protocol has no "send to JID" operation: the bridge sends to the owner, and to the group a group lane belongs to (PLAN 5.1, 2.13).
 import { LineSplitter } from "./stream.mjs";
 
 export function send(socket, obj) {

@@ -80,6 +80,21 @@ function real(p) {
 }
 const homesOf = (ctx) => [...new Set([ctx.home, real(ctx.home)])];
 
+// Claude Code loads CLAUDE.md, CLAUDE.local.md and .claude/ from the cwd and its parents, and the chat lane's cwd is ~/assistant.
+// A task or group lane may write them only inside its own cwd (derived from its lane identity, not from the hook's cwd, which `cd` moves).
+const INSTRUCTION_NAMES = new Set(["CLAUDE.md", "CLAUDE.local.md", ".claude"]);
+function instructionWrite(cand, ctx) {
+  for (const h of homesOf(ctx)) {
+    const a = join(h, "assistant");
+    if (!strictlyInside(cand, a)) continue;
+    const t = String(ctx.task ?? "");
+    const own = ctx.lane === "group" && /^grp_[\d-]+$/.test(t) ? join(a, "groups", t.slice(4)) : ctx.lane === "task" && /^[\w-]{1,64}$/.test(t) ? join(a, "tasks", t) : null;
+    if (own && inside(cand, own)) continue;
+    if (cand.slice(a.length + 1).split(sep).some((x) => INSTRUCTION_NAMES.has(x))) return "instruction-file-write";
+  }
+  return null;
+}
+
 // Writes the model may never make (PLAN 2.7, 5.2): returns a rule name or null.
 function protectedWrite(p, ctx) {
   for (const cand of new Set([p, real(p)])) {
@@ -92,6 +107,7 @@ function protectedWrite(p, ctx) {
       if (first === "agent-memory") { if (ctx.lane === "chat") continue; return "memory-write-not-chat-lane"; }
       return "policy-path-write";
     }
+    if (ctx.lane !== "chat") { const r = instructionWrite(cand, ctx); if (r) return r; } // unknown lane fails closed
     if (inside(cand, "/opt") || inside(cand, "/etc")) return "policy-path-write";
     for (const d of ["answers", "grants", "events", "sock"]) if (inside(cand, join(ctx.xchg, d))) return "policy-path-write";
   }
@@ -99,6 +115,7 @@ function protectedWrite(p, ctx) {
 }
 const WRITE_DENY_REASON = {
   "policy-path-write": "writes to ~/.claude (except wiki/), ~/.claude.json, /opt, /etc and /xchg/{answers,grants,events,sock} are never run by the agent",
+  "instruction-file-write": "task and group lanes may write CLAUDE.md, CLAUDE.local.md and .claude/ only inside their own working directory, never under ~/assistant elsewhere",
   "memory-write-not-chat-lane": "only the chat lane writes ~/.claude/agent-memory; ask the chat lane (remember it in the task report)",
 };
 const writeDenied = (rule) => deny(rule, WRITE_DENY_REASON[rule]);
@@ -123,6 +140,7 @@ export function claimGrants(home, ids) {
   return true;
 }
 function findGrant(kind, match, ctx) {
+  if (ctx.lane === "group") return null; // a group lane never uses a grant: they are the owner's, written from his own chat (PLAN 2.13)
   let files;
   try { files = readdirSync(join(ctx.xchg, "grants")).filter((f) => f.endsWith(".json")).sort(); } catch { return null; }
   const ms = (v) => (typeof v === "number" ? v : Date.parse(v));
@@ -399,7 +417,8 @@ function mentionsProtected(tokens, ctx) {
   const h = ctx.home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const home = `(?:~|\\$HOME|\\$\\{HOME\\}|${h})`;
   const memory = ctx.lane === "chat" ? "(?!wiki\\b|agent-memory\\b)" : "(?!wiki\\b)";
-  const re = new RegExp(`${home}/\\.claude\\.json|${home}/\\.claude/${memory}\\S|(?<![\\w.~/-])/(opt|etc)/|${ctx.xchg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/(answers|grants|events|sock)\\b`);
+  const instr = ctx.lane === "chat" ? "" : `|${home}/assistant/(?:CLAUDE\\.md|CLAUDE\\.local\\.md|\\.claude)\\b`;
+  const re = new RegExp(`${home}/\\.claude\\.json|${home}/\\.claude/${memory}\\S|(?<![\\w.~/-])/(opt|etc)/|${ctx.xchg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/(answers|grants|events|sock)\\b${instr}`);
   return tokens.some((t) => re.test(t));
 }
 

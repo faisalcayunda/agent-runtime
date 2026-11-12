@@ -5,7 +5,7 @@
 //                 alone, 2.3), denies ExitPlanMode and whatever
 //                 hooks/guard.mjs denies; allows the rest. Raw arguments are logged (shape not documented).
 //   ask_owner     rank 3, blocking, over the runner socket
-//   start_task    chat lane only: asks the runner for a task lane
+//   start_task    chat lane, or a group lane when the owner sent the message: asks the runner for a task lane
 //   notify_owner  kind done | critical (critical carries the code the bridge records); done is refused in the chat lane
 //   track_issue   registers a child or vehicle issue for the poller
 //   wiki_capture  asks the runner to run wiki-sync.sh (phase 6 seam)
@@ -63,7 +63,7 @@ const obj = (properties, required = []) => ({ type: "object", properties, requir
 export const TOOLS = [
   { name: "permission", description: "Permission prompt tool: allow everything except AskUserQuestion, ExitPlanMode and what the guard denies.", inputSchema: { type: "object", properties: { tool_name: { type: "string" }, input: { type: "object", additionalProperties: true }, tool_use_id: { type: "string" } }, additionalProperties: true } },
   { name: "ask_owner", description: "Ask Lord Faisal one short question over WhatsApp and wait for the reply. Only for short waits inside one turn; prefer AskUserQuestion.", inputSchema: obj({ question: { type: "string" } }, ["question"]) },
-  { name: "start_task", description: "Chat lane only: start a task lane for a Gremio issue that already exists. Returns started, queued or an error.", inputSchema: obj({ issue: { type: "string", description: "Multica issue id" } }, ["issue"]) },
+  { name: "start_task", description: "Chat lane, or a family-group turn that the owner himself started: start a task lane for a Gremio issue that already exists. Returns started, queued or an error.", inputSchema: obj({ issue: { type: "string", description: "Multica issue id" } }, ["issue"]) },
   { name: "notify_owner", description: "Task lane to WhatsApp. kind done: the task is finished (short report). kind critical: a critical action Lord Faisal must run himself; text carries the exact command and why, code is the code he replies with as 'done <code>' or 'deny <code>'.", inputSchema: obj({ kind: { type: "string", enum: ["done", "critical"] }, text: { type: "string" }, code: { type: "string", description: "critical only, like k7q-4821" } }, ["kind", "text"]) },
   { name: "track_issue", description: "Register a child or vehicle issue of this task so its comments and status wake this lane.", inputSchema: obj({ issue: { type: "string" }, role: { type: "string", enum: ["child", "vehicle"] } }, ["issue"]) },
   { name: "wiki_capture", description: "Commit and push wiki pages already written under ~/.claude/wiki (runs wiki-sync.sh outside the model).", inputSchema: obj({}) },

@@ -1,5 +1,6 @@
-// WhatsApp side of the bridge: Baileys socket, owner-only gate, normalized events, polls with persisted creation
-// messages (PLAN 2.2, 2.2.1, 5.2 item 1). It can only send to the owner: every send function takes no JID.
+// WhatsApp side of the bridge: Baileys socket, owner gate, group gate, normalized events, polls with persisted creation
+// messages (PLAN 2.2, 2.2.1, 2.13, 5.2 item 1). It sends to the owner (no send function takes a JID) and, through sendGroup,
+// to a group JID the bridge picked.
 //
 // Parts adapted from Hermes Agent's WhatsApp bridge (scripts/whatsapp-bridge/bridge.js and bridge_helpers.js,
 // github.com/NousResearch/hermes-agent @ 5df966a), MIT License, Copyright (c) 2025 Nous Research:
@@ -25,6 +26,54 @@ export function isOwnerMessage(msg, owners) {
   if (/@(g\.us|broadcast|newsletter|status)$/.test(chat) || chat.startsWith("status@")) return false;
   if (k.participant && !owners.has(bare(k.participant)) && !owners.has(bare(k.participantAlt))) return false;
   return [chat, bare(k.remoteJidAlt)].some((id) => id && owners.has(id));
+}
+
+// ---------- group gate (PLAN 2.13) ----------
+const GROUP_JID = /^\d{5,30}(?:-\d{1,20})?@g\.us$/;
+export const parseGroups = (s) => new Set(String(s ?? "").split(",").map((x) => x.trim()).filter((x) => GROUP_JID.test(x)));
+
+const contextOf = (m) => { for (const v of Object.values(m ?? {})) if (v && typeof v === "object" && v.contextInfo) return v.contextInfo; return null; };
+const GREMIO_ID = /^GR[0-9A-F]{30}$/; // the shape messageId() gives every message this bridge sends
+
+// True when a group message speaks to Gremio: it mentions the bot (phone JID or LID), quotes a message Gremio sent (its own
+// JID as the quoted author, or a quoted id of the shape the bridge generates), or its text starts with "gremio".
+export function isAddressed(msg, self) {
+  const m = unwrap(msg?.message);
+  const ctx = contextOf(m);
+  if ([...(ctx?.mentionedJid ?? []), ctx?.participant].some((j) => j && self.has(bare(j)))) return true;
+  if (GREMIO_ID.test(String(ctx?.stanzaId ?? ""))) return true;
+  return /^\s*gremio\b/i.test(normalizeMessage(msg).text);
+}
+
+// The family groups let any member address Gremio; every other group lets only an owner JID do it (phone form, learned LID or
+// its LID twin in participantAlt). Everything else returns null and is ignored without a trace. self: bare JIDs of the bot.
+export function groupGate(msg, { owners, family, self }) {
+  const k = msg?.key;
+  if (!k || k.fromMe || !/@g\.us$/.test(bare(k.remoteJid))) return null;
+  if (!isAddressed(msg, self)) return null;
+  const jid = bare(k.remoteJid);
+  const fromOwner = [k.participant, k.participantAlt].some((j) => j && owners.has(bare(j)));
+  const isFamily = family.has(jid);
+  if (!isFamily && !fromOwner) return null;
+  return { jid, fromOwner, family: isFamily };
+}
+
+// ---------- quoted message (a reply to something) ----------
+const QUOTED_MEDIA = ["imageMessage", "videoMessage", "documentMessage", "audioMessage", "stickerMessage"];
+export const QUOTE_MAX = 2000;
+export const maskJid = (j) => bare(j).split("@")[0].replace(/\d(?=\d{4})/g, "*");
+// What the message replies to, from contextInfo.quotedMessage (+ participant, its author): {author, text} or null. Media is never
+// downloaded: it is named as "[media: image]" with its caption. author is "Gremio", "owner", a masked number, or "?".
+export function quotedOf(msg, { self = new Set(), owners = new Set() } = {}) {
+  const ctx = contextOf(unwrap(msg?.message));
+  if (!ctx?.quotedMessage) return null;
+  const m = unwrap(ctx.quotedMessage);
+  const media = QUOTED_MEDIA.find((k) => m[k]);
+  let text = media ? `[media: ${media.replace("Message", "")}]${m[media].caption ? " " + m[media].caption : ""}` : (m.conversation ?? m.extendedTextMessage?.text ?? "");
+  if (!String(text).trim()) return null;
+  if (text.length > QUOTE_MAX) text = text.slice(0, QUOTE_MAX - 1) + "…";
+  const p = bare(ctx.participant);
+  return { author: !p ? "?" : self.has(p) ? "Gremio" : owners.has(p) ? "owner" : maskJid(p), text };
 }
 
 // ---------- normalizing ----------
@@ -90,7 +139,7 @@ export class ProxyAgent extends https.Agent {
 
 // ---------- the socket ----------
 // lib: the Baileys module (injected so tests can fake it). polls: {get(id) -> raw JSON string | undefined}.
-export function createWa({ lib, owners, ownerJid, authDir, xchg, polls, onMessage, onVote, onOpen, logger, agent, fetchVersion = true, qr = () => {}, log = () => {} }) {
+export function createWa({ lib, owners, groups = new Set(), ownerJid, authDir, xchg, polls, onMessage, onVote, onOpen, logger, agent, fetchVersion = true, qr = () => {}, log = () => {} }) {
   const outRetryMs = [2000, 5000, 10000];
   let sock = null, open = false, stopped = false, backoff = 1000;
   let waiters = [];
@@ -110,7 +159,7 @@ export function createWa({ lib, owners, ownerJid, authDir, xchg, polls, onMessag
     sock.ev.on("creds.update", saveCreds);
     sock.ev.on("connection.update", (u) => {
       if (u.qr) qr(u.qr);
-      if (u.connection === "open") { open = true; backoff = 1000; waiters.splice(0).forEach((w) => w()); onOpen?.(); addOwnerLids(); }
+      if (u.connection === "open") { open = true; backoff = 1000; waiters.splice(0).forEach((w) => w()); onOpen?.(); addOwnerLids(); listGroups(); }
       if (u.connection === "close") {
         open = false;
         const code = u.lastDisconnect?.error?.output?.statusCode;
@@ -129,17 +178,47 @@ export function createWa({ lib, owners, ownerJid, authDir, xchg, polls, onMessag
         catch (e) { log(`owner LID lookup failed: ${e.message}`); }
       }
     }
+    // To help the owner fill WA_GROUP_JIDS: one line per group (subject and id) while the list is empty. Nothing about members.
+    async function listGroups() {
+      if (groups.size) return;
+      try { for (const g of Object.values((await sock.groupFetchAllParticipating()) ?? {})) log(`group: ${String(g.subject ?? "").replace(/\s+/g, " ").trim()} ${g.id}`); }
+      catch (e) { log(`group list failed: ${e.message}`); }
+    }
+    const selfIds = () => new Set([sock?.user?.id, sock?.user?.lid].filter(Boolean).map(bare));
+    // A group message is dealt with only when it addresses Gremio, and then silently dropped unless the gate passes: group
+    // chatter and members' names are never logged. No media is saved from a group.
+    async function groupEvent(msg) {
+      const k = msg.key;
+      if (k.fromMe || !isAddressed(msg, selfIds())) return null;
+      if (k.participant && !k.participantAlt && /@lid$/.test(k.participant)) {
+        try { const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(k.participant); if (pn) k.participantAlt = pn; } catch { /* no mapping yet */ }
+      }
+      let g = groupGate(msg, { owners, family: groups, self: selfIds() });
+      if (!g && /@lid$/.test(k.participant ?? "")) { await addOwnerLids(); g = groupGate(msg, { owners, family: groups, self: selfIds() }); }
+      if (!g) return null;
+      const n = normalizeMessage(msg);
+      if (n.pollUpdate) return null;
+      const quoted = quotedOf(msg, { self: selfIds(), owners });
+      return { ...n, ...(quoted ? { quoted } : {}), group: { ...g, name: msg.pushName || maskJid(k.participantAlt ?? k.participant ?? ""), quote: { key: { id: k.id, remoteJid: k.remoteJid, participant: k.participant }, message: { conversation: n.text.slice(0, 200) } } } };
+    }
     // Both types: messages sent while the pod was down can arrive as `append` after a reconnect (PLAN 2.2).
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
       if (type !== "notify" && type !== "append") return;
       for (const msg of messages ?? []) {
         if (!msg.message) continue;
+        if (/@g\.us$/.test(msg.key?.remoteJid ?? "")) {
+          const n = await groupEvent(msg);
+          if (n) try { await onMessage(n); } catch (e) { log(`onMessage failed: ${e.stack}`); }
+          continue;
+        }
         if (!msg.key?.remoteJidAlt && /@lid$/.test(msg.key?.remoteJid ?? "")) {
           try { const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(msg.key.remoteJid); if (pn) msg.key.remoteJidAlt = pn; } catch { /* no mapping yet */ }
         }
         if (!isOwnerMessage(msg, owners) && /@lid$/.test(msg.key?.remoteJid ?? "")) await addOwnerLids();
         if (!isOwnerMessage(msg, owners)) { log(`dropped message from ${String(msg.key?.remoteJid).replace(/\d(?=\d{4})/g, "*")}`); continue; }
         const n = normalizeMessage(msg);
+        const quoted = quotedOf(msg, { self: selfIds(), owners });
+        if (quoted) n.quoted = quoted;
         if (n.pollUpdate) { handleVote(msg, n.pollUpdate); continue; }
         if (n.media) { try { n.files = [await saveMedia(msg, n)]; } catch (e) { log(`media failed: ${e.message}`); } }
         try { await onMessage(n); } catch (e) { log(`onMessage failed: ${e.stack}`); }
@@ -201,6 +280,8 @@ export function createWa({ lib, owners, ownerJid, authDir, xchg, polls, onMessag
     composing: () => sock?.sendPresenceUpdate?.("composing", to).catch(() => {}),
     // id: deterministic message id, so a resend after a crash is the same message to WhatsApp (UNVERIFIED that it dedupes).
     sendText: (text, { id } = {}) => withRetry(() => sock.sendMessage(to, { text }, id ? { messageId: id } : {})),
+    // The one send that takes a JID, and only a group JID: the bridge maps a group lane to its group and passes nothing else.
+    sendGroup: (jid, text, { id, quote } = {}) => (GROUP_JID.test(String(jid)) ? withRetry(() => sock.sendMessage(jid, { text }, { ...(id ? { messageId: id } : {}), ...(quote ? { quoted: quote } : {}) })) : Promise.reject(new Error("not a group JID"))),
     // Returns {id, raw}: the poll creation message, JSON-encoded for state.json (messageSecret included).
     sendPoll: (name, values, { id, multi = false } = {}) => withRetry(async () => {
       const sent = await sock.sendMessage(to, { poll: { name, values, selectableCount: multi ? values.length : 1 } }, id ? { messageId: id } : {});

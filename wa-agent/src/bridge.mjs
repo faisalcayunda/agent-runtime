@@ -2,9 +2,11 @@
 // model, GitHub or Multica credential. This file is the routing core plus startup and shutdown; the Baileys socket is
 // in wa.mjs and everything that runs `claude` is in runner.mjs, reached over /xchg/sock/run.sock.
 //
-// Core rules: the bridge sends only to the owner (wa.sendText has no JID argument); routing order for an inbound
-// text is (1) `done|deny <kode>`, (2) the head question, (3) the chat lane; one FIFO question queue across lanes;
-// the bridge starts every turn and owns every session id; every write goes through safeWrite.
+// Core rules: the bridge sends to the owner (wa.sendText has no JID argument) and, for a group lane, to the group that lane was
+// created for (wa.sendGroup, destination from S.groups only; PLAN 2.13); routing order for an inbound owner text is (1)
+// `done|deny <kode>`, (2) the head question, (3) the chat lane; one FIFO question queue across the owner's lanes; a group
+// message never enters that routing (no grants, no owner answers, only /baru); the bridge starts every turn and owns every
+// session id; every write goes through safeWrite.
 import net from "node:net";
 import { readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -15,7 +17,7 @@ import { parseCommand } from "./commands.mjs";
 import { questionsOf } from "./stream.mjs";
 import { attach, send } from "./ipc.mjs";
 import { messageId } from "./wa.mjs";
-import { inside, validFile, validId } from "./ids.mjs";
+import { groupLaneId, inside, isGroupLane, validFile, validId } from "./ids.mjs";
 
 const MAX_TEXT = 4000; // WhatsApp message length we split at (UNVERIFIED limit, PLAN 2.2 step 4)
 const POLL_MAX_OPTIONS = 12;
@@ -50,15 +52,16 @@ export function parseAnswer(q, raw) {
   return hit ?? t;
 }
 
-export function renderQuestion(head) {
+export function renderQuestion(head, { group = false } = {}) {
   const q = head.questions[head.cursor];
   const n = head.questions.length > 1 ? `(${head.cursor + 1}/${head.questions.length}) ` : "";
   const list = q.options.map((o, i) => `${i + 1}. ${o}`).join("\n");
-  const how = q.options.length ? (q.multiSelect ? "\n(jawab angka dipisah koma, atau ketik jawaban bebas)" : "\n(jawab angka, pilih di poll, atau ketik jawaban bebas)") : "";
+  // A group answer has to address Gremio too, or the group gate ignores it; no polls in a group.
+  const how = group ? "\n(balas pesan ini, atau awali dengan \"gremio\": angka atau jawaban bebas)" : q.options.length ? (q.multiSelect ? "\n(jawab angka dipisah koma, atau ketik jawaban bebas)" : "\n(jawab angka, pilih di poll, atau ketik jawaban bebas)") : "";
   return `${n}${q.question}${list ? "\n" + list : ""}${how}`;
 }
 
-export function createCore({ state, xchg, wa, toRunner, now = Date.now, log = () => {} }) {
+export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, log = () => {} }) {
   const S = state.d;
   const save = () => state.save();
   const known = (id) => id === "chat" || (validId(id) && !!S.lanes[id]);
@@ -76,38 +79,56 @@ export function createCore({ state, xchg, wa, toRunner, now = Date.now, log = ()
   const serial = (fn) => (...args) => { const r = chain.then(() => fn(...args)); chain = r.catch(() => {}); return r; };
 
   // ---- outbound: dedup ledger, chunking, retry list ----
-  async function sendOnce(key, text) {
+  // to: null = the owner; {jid, quote} = a group (the first chunk quotes the message that triggered the reply).
+  async function sendOnce(key, text, to = null) {
     if (S.outbox[key] || !text.trim()) return;
     const parts = splitText(text);
     try {
-      for (let i = 0; i < parts.length; i++) await wa.sendText(parts[i], { id: messageId(key, i) });
+      for (let i = 0; i < parts.length; i++) {
+        if (to) await wa.sendGroup(to.jid, parts[i], { id: messageId(key, i), ...(i === 0 && to.quote ? { quote: to.quote } : {}) });
+        else await wa.sendText(parts[i], { id: messageId(key, i) });
+      }
       S.outbox[key] = now();
     } catch (e) {
       log(`send failed, kept for retry: ${e.message}`);
-      S.pendingOut.push({ key, text });
+      S.pendingOut.push({ key, text, ...(to ? { to } : {}) });
     }
     save();
   }
   async function flushPending() {
     const list = S.pendingOut.splice(0);
     save();
-    for (const p of list) await sendOnce(p.key, p.text);
+    for (const p of list) await sendOnce(p.key, p.text, p.to ?? null);
   }
+  // The destination of a group lane: the JID its first gated message registered, still allowed today (a family group removed
+  // from WA_GROUP_JIDS stops receiving), with the message to quote. Null for anything else.
+  const laneDest = (id) => {
+    const g = isGroupLane(id) ? S.groups[id] : null;
+    if (!g || groupLaneId(g.jid) !== id || (g.family && !groups.has(g.jid))) return null;
+    return { jid: g.jid, quote: S.lanes[id]?.quote ?? null };
+  };
 
   // ---- turns ----
-  const hasQuestion = (id) => S.queue.some((q) => q.lane === id);
+  const hasQuestion = (id) => (isGroupLane(id) ? !!S.gq[id]?.length : S.queue.some((q) => q.lane === id));
+  // One group turn at a time across all groups: each is one more `claude` process on top of chat and the task lane (D20 memory budget).
+  const groupBusy = (id) => Object.entries(S.lanes).some(([k, l]) => k !== id && isGroupLane(k) && l.inflight);
   function pump(id) {
     const L = S.lanes[id];
     // A lane with a question waiting runs nothing: its only next turn is the empty resume after the answer.
     if (!L || !runnerUp || L.inflight || !L.queue.length || hasQuestion(id)) return;
-    const items = L.resumeFirst ? [L.queue.shift()] : L.queue.splice(0);
+    const group = isGroupLane(id);
+    if (group && groupBusy(id)) return;
+    // A group turn is one message from one sender, so the owner flag below describes exactly that sender.
+    const items = L.resumeFirst || group ? [L.queue.shift()] : L.queue.splice(0);
     L.resumeFirst = false;
     const raw = items.map((i) => i.text).filter(Boolean);
-    L.inflight = { raw, ids: items.map((i) => i.id).filter(Boolean), answered: items.find((i) => i.answered)?.answered ?? null };
+    L.inflight = { raw, ids: items.map((i) => i.id).filter(Boolean), answered: items.find((i) => i.answered)?.answered ?? null, ...(group ? { fromOwner: items[0].fromOwner === true } : {}) };
+    if (group && items[0].quote) L.quote = items[0].quote;
     save();
-    toRunner({ op: "turn", lane: id, task: id === "chat" ? undefined : id, session: S.sessions[id] ?? null, prompt: raw.join("\n\n"), origin: L.inflight.ids });
+    toRunner({ op: "turn", lane: id, task: id === "chat" || group ? undefined : id, session: S.sessions[id] ?? null, prompt: items.map((i) => (i.pre ? `${i.pre}\n${i.text}` : i.text)).filter(Boolean).join("\n\n"), origin: L.inflight.ids, ...(group ? { group: true, fromOwner: L.inflight.fromOwner } : {}) });
   }
-  function enqueue(id, text, msgId) { if (!known(id)) return log(`no lane ${id}`); lane(id).queue.push({ text, id: msgId ?? null }); save(); pump(id); }
+  // pre: what the message replies to, for the model only. It stays out of `raw`, which grants and requeues read.
+  function enqueue(id, text, msgId, pre) { if (!known(id)) return log(`no lane ${id}`); lane(id).queue.push({ text, id: msgId ?? null, ...(pre ? { pre } : {}) }); save(); pump(id); }
 
   // ---- questions ----
   async function showHead() {
@@ -167,7 +188,67 @@ export function createCore({ state, xchg, wa, toRunner, now = Date.now, log = ()
     return showHead();
   }
 
+  // ---- group questions: a group lane's AskUserQuestion is asked in its group, in that lane's own small queue ----
+  async function showGroupHead(id) {
+    const head = S.gq[id]?.[0], to = laneDest(id);
+    if (!head || head.shown || !to) return;
+    await sendOnce(`q:${head.id}:${head.cursor}`, renderQuestion(head, { group: true }), to);
+    head.shown = true;
+    save();
+  }
+  function enqueueGroupQuestion(entry) {
+    const q = (S.gq[entry.lane] ??= []);
+    if (!q.some((x) => x.id === entry.id)) { q.push({ cursor: 0, answers: {}, shown: false, ...entry }); save(); }
+    return showGroupHead(entry.lane);
+  }
+  // Any gated message in the group answers its head question. No grant is ever written from here, whatever the question says.
+  async function answerGroupHead(id, text, g) {
+    const head = S.gq[id][0];
+    const q = head.questions[head.cursor];
+    head.answers[q.question] = parseAnswer(q, text);
+    head.cursor++;
+    if (head.cursor < head.questions.length) { head.shown = false; save(); return showGroupHead(id); }
+    safeWrite(inside(answersDir, `${head.id}.json`), JSON.stringify({ questions: head.input?.questions ?? [], answers: head.answers }), 0o644);
+    S.gq[id].shift();
+    if (!S.gq[id].length) delete S.gq[id];
+    lane(id).queue.unshift({ text: "", id: null, answered: head.id, quote: g.quote, fromOwner: g.fromOwner === true });
+    lane(id).resumeFirst = true;
+    save();
+    pump(id);
+    return showGroupHead(id);
+  }
+
   // ---- inbound ----
+  // The sender's name as the model sees it: one line, no brackets, and "(owner)" only where the WhatsApp layer proved it.
+  const labelOf = (g) => `${String(g.name ?? "").replace(/[\[\]()]/g, "").replace(/\s+/g, " ").trim().slice(0, 40) || "?"}${g.fromOwner === true ? " (owner)" : ""}`;
+  const preOf = (q) => (q?.text ? `[membalas ${String(q.author ?? "?").replace(/[\[\]\n]/g, " ")}]: ${q.text}` : "");
+  const ADDRESS = /^\s*(?:(?:@\d+|gremio)\b[\s,:;.!-]*)+/i;
+  // A group message: its own lane per group, never route(). Allowed when the group is in the family list or the sender is the owner.
+  async function onGroupMessage(n) {
+    const g = n.group, id = groupLaneId(g.jid);
+    if (!id || !n.text?.trim() || !(groups.has(g.jid) || g.fromOwner === true)) return;
+    S.groups[id] = { jid: g.jid, family: groups.has(g.jid) };
+    S.lanes[id] ??= newLane();
+    const bare = n.text.replace(ADDRESS, "");
+    const cmd = parseCommand(bare);
+    if (cmd) { // only /baru works in a group: /stop, /status and /memori belong to the owner's own chat
+      if (cmd !== "baru") return save();
+      const L = lane(id);
+      delete S.sessions[id];
+      delete S.gq[id];
+      L.queue = [];
+      if (L.inflight) L.fresh = true;
+      L.quote = g.quote;
+      save();
+      return sendOnce(`cmd:${id}:${now()}`, "Sesi baru.", laneDest(id));
+    }
+    if (S.gq[id]?.length) return answerGroupHead(id, bare, g);
+    const pre = preOf(n.quoted);
+    lane(id).queue.push({ text: `[${labelOf(g)}] ${pre ? pre + "\n" : ""}${n.text.trim()}`, id: n.id, quote: g.quote, fromOwner: g.fromOwner === true });
+    save();
+    return pump(id);
+  }
+
   async function onMessage(n) {
     if (S.inbox[n.id]) return log(`duplicate ${n.id}`);
     // Cutoff is the pairing time, not the newest message: a message that was late (a reconnect `append`) is still his,
@@ -176,15 +257,16 @@ export function createCore({ state, xchg, wa, toRunner, now = Date.now, log = ()
     S.inbox[n.id] = n.ts;
     S.lastTs = Math.max(S.lastTs, n.ts);
     save();
+    if (n.group) return onGroupMessage(n);
     wa.composing();
     const text = [n.text, ...(n.files ?? []).map((f) => `[file: ${f}]`)].filter(Boolean).join("\n");
     if (!text) return;
     const cmd = parseCommand(text);
     if (cmd) return runCommand(cmd);
-    return route(text, n.id);
+    return route(text, n.id, preOf(n.quoted));
   }
 
-  async function route(text, msgId) {
+  async function route(text, msgId, pre) {
     const ap = parseApproval(text);
     const rec = ap && S.codes[ap.code];
     if (rec && known(rec.lane) && now() - rec.ts < CODE_TTL_MS) { // (1) goes to the lane whose message carried the code
@@ -193,7 +275,7 @@ export function createCore({ state, xchg, wa, toRunner, now = Date.now, log = ()
       return enqueue(rec.lane, text, msgId);
     }
     if (S.queue[0]) return answerHead(parseAnswerFor(S.queue[0], text), text); // (2) the head question
-    return enqueue("chat", text, msgId); // (3) the chat lane
+    return enqueue("chat", text, msgId, pre); // (3) the chat lane
   }
   const parseAnswerFor = (head, text) => (head.kind === "ask-owner" ? text : parseAnswer(head.questions[head.cursor], text));
 
@@ -245,21 +327,22 @@ export function createCore({ state, xchg, wa, toRunner, now = Date.now, log = ()
       case "hello": {
         runnerUp = true;
         if (nonceFile) { try { unlinkSync(nonceFile); } catch { /* gone */ } nonceFile = null; }
-        for (const t of Array.isArray(m.tasks) ? m.tasks : []) if (validId(t) && t !== "chat") S.lanes[t] ??= newLane(); // lanes the runner still has
+        for (const t of Array.isArray(m.tasks) ? m.tasks : []) if (validId(t) && t !== "chat" && !isGroupLane(t)) S.lanes[t] ??= newLane(); // lanes the runner still has
         const alive = new Set([...(m.busy ?? []), ...(m.buffered ?? [])]); // running, or finished with the result about to be replayed
         for (const [id, L] of Object.entries(S.lanes)) {
           if (L.inflight && !alive.has(id)) { // the turn died with the runner: resume it (CLAUDE_CODE_RESUME_INTERRUPTED_TURN)
             const raw = L.inflight.raw;
             L.inflight = null;
-            L.queue.unshift({ text: S.sessions[id] ? "" : raw.join("\n\n"), id: null });
+            L.queue.unshift({ text: S.sessions[id] ? "" : raw.join("\n\n"), id: null, ...(isGroupLane(id) ? { fromOwner: L.inflight?.fromOwner === true } : {}) });
           }
         }
         save();
         for (const id of Object.keys(S.lanes)) pump(id);
+        for (const id of Object.keys(S.gq)) await showGroupHead(id);
         return showHead();
       }
       case "task-started": {
-        if (!validId(m.task) || m.task === "chat") return log(`rejected task id ${String(m.task).slice(0, 40)}`);
+        if (!validId(m.task) || m.task === "chat" || isGroupLane(m.task)) return log(`rejected task id ${String(m.task).slice(0, 40)}`);
         S.lanes[m.task] ??= newLane();
         const L = lane(m.task);
         S.tasks[m.task] = { at: now() };
@@ -286,7 +369,7 @@ export function createCore({ state, xchg, wa, toRunner, now = Date.now, log = ()
       case "notice": return sendOnce(`notice:${now()}`, String(m.text ?? ""));
       case "memori": if (memoriWaiting.delete(String(m.id))) return sendOnce(`memori:${m.id}`, String(m.text ?? "") || "(kosong)"); return;
       case "ask": {
-        if (!/^ask-[0-9a-f]{16,64}$/.test(String(m.rid)) || !known(m.lane)) return log("rejected ask");
+        if (!/^ask-[0-9a-f]{16,64}$/.test(String(m.rid)) || !known(m.lane) || isGroupLane(m.lane)) return log("rejected ask"); // a group lane never reaches the owner's queue
         return enqueueQuestion({ id: `ask:${m.rid}`, kind: "ask-owner", rid: m.rid, lane: m.lane, text: String(m.text ?? "") });
       }
       case "dunan": {
@@ -301,15 +384,22 @@ export function createCore({ state, xchg, wa, toRunner, now = Date.now, log = ()
     if (!known(m.lane)) return log(`event ${m.ev} for unknown lane ${String(m.lane).slice(0, 40)}`);
     switch (m.ev) {
       case "session": { const L = lane(m.lane); if (!L.fresh && validSession(m.sessionId)) { S.sessions[m.lane] = m.sessionId; save(); } return; }
-      case "text": if (m.lane === "chat" && typeof m.key === "string" && m.key.length <= 200) return sendOnce(`t:${m.key}`, String(m.text ?? "")); return; // a task lane's text is never sent
+      case "text": { // a task lane's text is never sent; a group lane's goes to its own group
+        if (typeof m.key !== "string" || m.key.length > 200) return;
+        if (m.lane === "chat") return sendOnce(`t:${m.key}`, String(m.text ?? ""));
+        const to = laneDest(m.lane);
+        if (to) return sendOnce(`t:${m.key}`, String(m.text ?? ""), to);
+        return;
+      }
       case "busy": { // the runner still runs this lane (race after a restart): put the request back, wait for that turn's result
         const L = lane(m.lane);
-        L.queue.unshift(...(L.inflight?.raw ?? []).map((text) => ({ text, id: null })));
+        L.queue.unshift(...(L.inflight?.raw ?? []).map((text) => ({ text, id: null, ...(isGroupLane(m.lane) ? { fromOwner: L.inflight?.fromOwner === true } : {}) })));
         L.inflight = { raw: [], ids: [], answered: L.inflight?.answered ?? null };
         return save();
       }
       case "result": return onResult(m);
       case "notify": {
+        if (isGroupLane(m.lane)) return log("rejected notify from a group lane");
         if (m.kind !== "done" && m.kind !== "critical") return;
         if (m.nid != null && !validId(m.nid)) return log("rejected notify id");
         if (m.kind === "critical") {
@@ -338,9 +428,9 @@ export function createCore({ state, xchg, wa, toRunner, now = Date.now, log = ()
       u.turns++; u.input += m.usage.input_tokens ?? 0; u.output += m.usage.output_tokens ?? 0;
       u.cache_read += m.usage.cache_read_input_tokens ?? 0; u.cache_creation += m.usage.cache_creation_input_tokens ?? 0;
     }
-    if (m.error && m.error !== "stopped") await sendOnce(`err:${m.lane}:${now()}`, `Turn ${m.lane === "chat" ? "chat" : `task ${m.lane}`} error: ${String(m.error).slice(0, 300)}`);
+    if (m.error && m.error !== "stopped") await sendOnce(`err:${m.lane}:${now()}`, `Turn ${m.lane === "chat" ? "chat" : isGroupLane(m.lane) ? `grup ${m.lane}` : `task ${m.lane}`} error: ${String(m.error).slice(0, 300)}`);
     if (m.deferred) {
-      if (m.deferred.name === "AskUserQuestion" && validId(m.deferred.id)) await enqueueQuestion({ id: m.deferred.id, kind: "ask-user", lane: m.lane, input: m.deferred.input, questions: questionsOf(m.deferred.input) });
+      if (m.deferred.name === "AskUserQuestion" && validId(m.deferred.id)) await (isGroupLane(m.lane) ? enqueueGroupQuestion : enqueueQuestion)({ id: m.deferred.id, kind: "ask-user", lane: m.lane, input: m.deferred.input, questions: questionsOf(m.deferred.input) });
       else log(`rejected deferred tool ${String(m.deferred.name).slice(0, 40)} id ${String(m.deferred.id).slice(0, 40)}`);
     }
     if (L.done && !L.queue.length && !hasQuestion(m.lane)) {
@@ -350,7 +440,8 @@ export function createCore({ state, xchg, wa, toRunner, now = Date.now, log = ()
     }
     save();
     pump(m.lane);
-    return showHead();
+    for (const id of Object.keys(S.lanes)) if (isGroupLane(id) && id !== m.lane) pump(id); // a group turn waiting for this one
+    return isGroupLane(m.lane) ? showGroupHead(m.lane) : showHead();
   }
 
   return {
@@ -384,19 +475,20 @@ async function main() {
   const { default: pino } = await import("pino");
   const { default: qrt } = await import("qrcode-terminal");
   const lib = await import("@whiskeysockets/baileys");
-  const { createWa, parseOwners, ProxyAgent } = await import("./wa.mjs");
+  const { createWa, parseGroups, parseOwners, ProxyAgent } = await import("./wa.mjs");
   const proxy = env.HTTPS_PROXY || env.https_proxy;
 
+  const groups = parseGroups(env.WA_GROUP_JIDS); // family groups: any member may address Gremio there (PLAN 2.13)
   let conn = null, core = null;
   const toRunner = (m) => send(conn, m);
   const polls = { get: (id) => state.d.polls[id]?.raw };
   const wa = createWa({
-    lib, owners: parseOwners(owner), ownerJid: owner.split(",")[0], authDir: join(dir, "auth"), xchg, polls,
+    lib, owners: parseOwners(owner), groups, ownerJid: owner.split(",")[0], authDir: join(dir, "auth"), xchg, polls,
     logger: pino({ level: env.WA_LOG_LEVEL ?? "warn" }), agent: proxy ? new ProxyAgent(proxy) : undefined,
     fetchVersion: env.WA_FETCH_VERSION !== "0", qr: (q) => qrt.generate(q, { small: true }), log,
     onMessage: (n) => core.onMessage(n), onVote: (v) => core.onVote(v), onOpen: () => core.onOpen(),
   });
-  core = createCore({ state, xchg, wa, toRunner, log });
+  core = createCore({ state, xchg, wa, toRunner, groups, log });
   core.sweep();
   setInterval(() => core.sweep(), 3600 * 1000).unref();
 

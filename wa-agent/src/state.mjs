@@ -27,10 +27,12 @@ const fresh = () => ({
   codes: {},                 // critical-action code -> {lane, ts}
   grants: {}, grantsUsed: {},// grant id -> {kind, ts}
   tasks: {},                 // task lane -> {at}
+  groups: {},                // group lane (grp_<digits>) -> {jid, family}: the only place a group destination is stored (PLAN 2.13)
+  gq: {},                    // group lane -> its own question queue (never the owner's)
   usage: {},                 // yyyy-mm-dd -> {turns, input, output, cache_read, cache_creation}
 });
 
-const MAPS = ["sessions", "lanes", "polls", "inbox", "outbox", "codes", "grants", "grantsUsed", "tasks", "usage"];
+const MAPS = ["sessions", "lanes", "polls", "inbox", "outbox", "codes", "grants", "grantsUsed", "tasks", "groups", "gq", "usage"];
 const LIMITS = { inbox: 2000, outbox: 2000, polls: 200, grantsUsed: 500, codes: 200 };
 
 export function openState(path) {

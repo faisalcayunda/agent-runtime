@@ -41,6 +41,11 @@ export function resetPolicy({ home, assets }) {
     const ok = haveSrc ? treeHash(dst) === treeHash(src) : isFile ? !lstatOk(dst) : isEmptyDir(dst);
     if (!ok) { mirror(haveSrc ? src : null, dst, isFile); changed.push(name); }
   }
+  // The chat lane's cwd is ~/assistant: Claude Code would load these as instructions, and a task or group lane could plant them.
+  for (const name of ["CLAUDE.md", "CLAUDE.local.md", ".claude"]) {
+    const p = join(home, "assistant", name);
+    if (lstatOk(p)) { rmSync(p, { recursive: true, force: true }); changed.push(`assistant/${name}`); }
+  }
   // settings.json must be exactly {}
   const sj = join(claude, "settings.json");
   let ok = false;

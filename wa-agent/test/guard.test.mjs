@@ -289,3 +289,42 @@ test("the real scanner skips a pragma file (why the guard must deny it) and the 
   const reason = secretEval({ tool_name: "Write", tool_input: { file_path: join(S.home, ".claude", "wiki", "a.md"), content: `# ${PRAGMA}\n${fake}` } }, { home: S.home, scan: (t) => defaultScan(t, MAC_SCANNER) });
   assert.match(reason, /allow-file/);
 });
+
+test("a group-lane memory write is denied like a task lane's; a group lane never uses a merge grant", () => {
+  const mem = join(S.home, ".claude", "agent-memory", "MEMORY.md");
+  denies(file("Write", mem, { lane: "group" }), "memory-write-not-chat-lane");
+  denies(file("Edit", mem, { lane: "group" }), "memory-write-not-chat-lane");
+  denies(bash(`echo x >> ${mem}`, { lane: "group" }), "memory-write-not-chat-lane");
+  denies(bash(`python3 -c "open('${mem}','w')"`, { lane: "group" }), "policy-path-write");
+  passes(file("Write", join(S.home, "assistant", "groups", "120363", "n.md"), { lane: "group" }));
+  const url = "https://github.com/o/r/pull/41";
+  grantFile({ id: "g-grp-merge", kind: "merge", url, created_at: Date.now() });
+  denies(bash(`gh pr merge ${url} --squash`, { lane: "group", task: "grp_120363" }), "merge-no-grant");
+  assert.deepEqual(bash(`gh pr merge ${url} --squash`, { lane: "chat" }).grants, ["g-grp-merge"]); // the chat lane still can
+});
+
+test("task and group lanes cannot write instruction files under ~/assistant outside their own cwd; the chat lane's reset removes them", () => {
+  const A = join(S.home, "assistant");
+  const own = { task: { lane: "task", task: "t1" }, group: { lane: "group", task: "grp_120363" } };
+  const mine = { task: join(A, "tasks", "t1"), group: join(A, "groups", "120363") };
+  for (const kind of ["task", "group"]) {
+    const o = own[kind];
+    for (const p of [join(A, "CLAUDE.md"), join(A, "CLAUDE.local.md"), join(A, ".claude", "settings.json"), join(A, ".claude", "skills", "x", "SKILL.md"),
+      join(A, "tasks", "other", "CLAUDE.md"), join(A, "groups", "999999", ".claude", "x.md"), join(A, "repos", "app", "CLAUDE.local.md"), join(A, "groups", "CLAUDE.md"), join(A, "tasks", "t1x", "CLAUDE.md")]) {
+      for (const tool of ["Write", "Edit", "NotebookEdit"]) denies(file(tool, p, o), "instruction-file-write");
+      denies(bash(`echo evil > ${p}`, o), "instruction-file-write");
+      denies(bash(`tee -a ${p} <<< evil`, o), "instruction-file-write");
+      denies(bash(`sed -i 's/a/b/' ${p}`, o), "instruction-file-write");
+    }
+    denies(bash(`python3 -c "open('${A}/CLAUDE.md','w').write('x')"`, o), "policy-path-write");
+    denies(bash(`cd ${A} && echo evil > CLAUDE.md`, o, { cwd: A }), "instruction-file-write");
+    denies(file("Write", join(A, "CLAUDE.md"), { lane: undefined }), "instruction-file-write"); // fail closed when the lane is unknown
+    // its own cwd, and ordinary files, stay writable
+    passes(file("Write", join(mine[kind], "CLAUDE.md"), o));
+    passes(file("Write", join(mine[kind], ".claude", "notes.md"), o));
+    passes(file("Write", join(mine[kind], "repo", "CLAUDE.md"), o));
+    passes(file("Write", join(A, "tasks", "other", "notes.md"), o));
+    passes(bash(`echo ok > ${join(mine[kind], "out.txt")}`, o));
+  }
+  passes(file("Write", join(A, "CLAUDE.md"), { lane: "chat" })); // the chat lane is not guarded here; the pre-turn reset removes the file
+});
