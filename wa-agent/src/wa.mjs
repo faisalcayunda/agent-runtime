@@ -110,7 +110,7 @@ export function createWa({ lib, owners, ownerJid, authDir, xchg, polls, onMessag
     sock.ev.on("creds.update", saveCreds);
     sock.ev.on("connection.update", (u) => {
       if (u.qr) qr(u.qr);
-      if (u.connection === "open") { open = true; backoff = 1000; waiters.splice(0).forEach((w) => w()); onOpen?.(); }
+      if (u.connection === "open") { open = true; backoff = 1000; waiters.splice(0).forEach((w) => w()); onOpen?.(); addOwnerLids(); }
       if (u.connection === "close") {
         open = false;
         const code = u.lastDisconnect?.error?.output?.statusCode;
@@ -120,6 +120,15 @@ export function createWa({ lib, owners, ownerJid, authDir, xchg, polls, onMessag
         backoff = Math.min(backoff * 2, 60000);
       }
     });
+    // WhatsApp now addresses 1:1 senders by LID; learn each owner phone JID's LID from the server (seen 2026-11-12:
+    // the owner's first message arrived as <lid>@lid with no remoteJidAlt and no stored mapping, and was dropped).
+    async function addOwnerLids() {
+      const m = sock?.signalRepository?.lidMapping;
+      for (const pn of [...owners].filter((j) => j.endsWith("@s.whatsapp.net"))) {
+        try { const lid = await m?.getLIDForPN?.(pn); if (lid && !owners.has(bare(lid))) { owners.add(bare(lid)); log("owner LID learned"); } }
+        catch (e) { log(`owner LID lookup failed: ${e.message}`); }
+      }
+    }
     // Both types: messages sent while the pod was down can arrive as `append` after a reconnect (PLAN 2.2).
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
       if (type !== "notify" && type !== "append") return;
@@ -128,6 +137,7 @@ export function createWa({ lib, owners, ownerJid, authDir, xchg, polls, onMessag
         if (!msg.key?.remoteJidAlt && /@lid$/.test(msg.key?.remoteJid ?? "")) {
           try { const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(msg.key.remoteJid); if (pn) msg.key.remoteJidAlt = pn; } catch { /* no mapping yet */ }
         }
+        if (!isOwnerMessage(msg, owners) && /@lid$/.test(msg.key?.remoteJid ?? "")) await addOwnerLids();
         if (!isOwnerMessage(msg, owners)) { log(`dropped message from ${String(msg.key?.remoteJid).replace(/\d(?=\d{4})/g, "*")}`); continue; }
         const n = normalizeMessage(msg);
         if (n.pollUpdate) { handleVote(msg, n.pollUpdate); continue; }
