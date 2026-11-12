@@ -3,26 +3,44 @@
 // in wa.mjs and everything that runs `claude` is in runner.mjs, reached over /xchg/sock/run.sock.
 //
 // Core rules: the bridge sends to the owner (wa.sendText has no JID argument) and, for a group lane, to the group that lane was
-// created for (wa.sendGroup, destination from S.groups only; PLAN 2.13); routing order for an inbound owner text is (1)
+// created for (wa.sendGroup, destination from S.groups only; PLAN 2.13); the 👀 reaction and the ack line follow the same two
+// destinations (wa.react: the owner, or the message's own group); routing order for an inbound owner text is (1)
 // `done|deny <kode>`, (2) the head question, (3) the chat lane; one FIFO question queue across the owner's lanes; a group
 // message never enters that routing (no grants, no owner answers, only /baru); the bridge starts every turn and owns every
 // session id; every write goes through safeWrite.
 import net from "node:net";
 import { readdirSync, statSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { openState, safeWrite } from "./state.mjs";
 import { CODE_PATTERN, PR_URL, deleteGrant, isMergeYes, parseApproval, pushMainOrder, sweepGrants, writeGrant } from "./grants.mjs";
 import { parseCommand } from "./commands.mjs";
 import { questionsOf } from "./stream.mjs";
 import { attach, send } from "./ipc.mjs";
-import { messageId } from "./wa.mjs";
+import { MEDIA_CAPS, messageId } from "./wa.mjs";
 import { groupLaneId, inside, isGroupLane, validFile, validId } from "./ids.mjs";
 
 const MAX_TEXT = 4000; // WhatsApp message length we split at (UNVERIFIED limit, PLAN 2.2 step 4)
 const POLL_MAX_OPTIONS = 12;
 const CODE_TTL_MS = 24 * 3600 * 1000;
 const POLL_UNREADABLE = "poll-nya gak kebaca, jawab pakai angka aja ya";
+// Acknowledge work (owner decision 2026-11-12): a reaction at once, and one short line when a turn has said nothing for ACK_MS.
+const ACK_MS = 15000;
+const ACK_LINES = ["Oke, lagi aku kerjain ya.", "Siap, bentar ya, lagi aku cek.", "Sip, aku proses dulu ya.", "Oke, bentar ya, lagi aku urus."];
+const ackLine = (msgId) => ACK_LINES[parseInt(messageId(`ack-line:${msgId}`).slice(2, 6), 16) % ACK_LINES.length];
+const mb = (kind) => MEDIA_CAPS[kind] / 1024 / 1024;
+const MEDIA_LABEL = { image: "gambar", sticker: "stiker", video: "video" };
+
+// What the model reads for one message's media (owner DM or group). A video is only named here: the runner swaps the
+// marker for extracted frames before the turn (it cannot be read directly). Others (document, audio) keep `[file: path]`.
+export function mediaNotes(n) {
+  const md = n.media, label = MEDIA_LABEL[md?.kind];
+  if (!label) return { notes: (n.files ?? []).map((f) => `[file: ${f}]`), videos: [] };
+  if (md.tooLarge) return { notes: [`[${label}: terlalu besar (>${mb(md.kind)} MB), dilewati]`], videos: [] };
+  if (!md.path) return { notes: [], videos: [] };
+  if (md.kind === "video") return { notes: [`[video: ${basename(md.path)}]`], videos: [{ name: basename(md.path), seconds: md.seconds || 0 }] };
+  return { notes: [`[${label}: ${md.path}]`], videos: [] };
+}
 
 export function splitText(text, max = MAX_TEXT) {
   const out = [];
@@ -61,7 +79,7 @@ export function renderQuestion(head, { group = false } = {}) {
   return `${n}${q.question}${list ? "\n" + list : ""}${how}`;
 }
 
-export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, log = () => {} }) {
+export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now = Date.now, log = () => {}, setTimer = (f, ms) => { const t = setTimeout(f, ms); t.unref(); return t; }, clearTimer = clearTimeout, ackMs = ACK_MS, statusMs = 2000 }) {
   const S = state.d;
   const save = () => state.save();
   const known = (id) => id === "chat" || (validId(id) && !!S.lanes[id]);
@@ -80,7 +98,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
 
   // ---- outbound: dedup ledger, chunking, retry list ----
   // to: null = the owner; {jid, quote} = a group (the first chunk quotes the message that triggered the reply).
-  async function sendOnce(key, text, to = null) {
+  async function sendOnce(key, text, to = null, retry = true) {
     if (S.outbox[key] || !text.trim()) return;
     const parts = splitText(text);
     try {
@@ -90,8 +108,8 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       }
       S.outbox[key] = now();
     } catch (e) {
-      log(`send failed, kept for retry: ${e.message}`);
-      S.pendingOut.push({ key, text, ...(to ? { to } : {}) });
+      log(`send failed${retry ? ", kept for retry" : ""}: ${e.message}`);
+      if (retry) S.pendingOut.push({ key, text, ...(to ? { to } : {}) });
     }
     save();
   }
@@ -122,13 +140,36 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     const items = L.resumeFirst || group ? [L.queue.shift()] : L.queue.splice(0);
     L.resumeFirst = false;
     const raw = items.map((i) => i.text).filter(Boolean);
-    L.inflight = { raw, ids: items.map((i) => i.id).filter(Boolean), answered: items.find((i) => i.answered)?.answered ?? null, ...(group ? { fromOwner: items[0].fromOwner === true } : {}) };
+    const videos = items.flatMap((i) => i.videos ?? []);
+    L.inflight = { raw, ids: items.map((i) => i.id).filter(Boolean), answered: items.find((i) => i.answered)?.answered ?? null, ...(videos.length ? { videos } : {}), ...(group ? { fromOwner: items[0].fromOwner === true } : {}) };
     if (group && items[0].quote) L.quote = items[0].quote;
     save();
-    toRunner({ op: "turn", lane: id, task: id === "chat" || group ? undefined : id, session: S.sessions[id] ?? null, prompt: items.map((i) => (i.pre ? `${i.pre}\n${i.text}` : i.text)).filter(Boolean).join("\n\n"), origin: L.inflight.ids, ...(group ? { group: true, fromOwner: L.inflight.fromOwner } : {}) });
+    startAck(id, items.find((i) => i.ack)?.id);
+    toRunner({ op: "turn", lane: id, task: id === "chat" || group ? undefined : id, session: S.sessions[id] ?? null, prompt: items.map((i) => (i.pre ? `${i.pre}\n${i.text}` : i.text)).filter(Boolean).join("\n\n"), origin: L.inflight.ids, ...(videos.length ? { videos } : {}), ...(group ? { group: true, fromOwner: L.inflight.fromOwner } : {}) });
   }
-  // pre: what the message replies to, for the model only. It stays out of `raw`, which grants and requeues read.
-  function enqueue(id, text, msgId, pre) { if (!known(id)) return log(`no lane ${id}`); lane(id).queue.push({ text, id: msgId ?? null, ...(pre ? { pre } : {}) }); save(); pump(id); }
+  // extra: pre (what the message replies to: for the model only, it stays out of `raw`, which grants and requeues read),
+  // videos (the runner turns them into frames) and ack (a user message that gets a reaction and maybe an ack line).
+  function enqueue(id, text, msgId, extra = {}) { if (!known(id)) return log(`no lane ${id}`); lane(id).queue.push({ text, id: msgId ?? null, ...extra }); save(); pump(id); }
+
+  // ---- acknowledge work: one reaction at once, one line when the turn has sent no text for ackMs (no model call) ----
+  const acks = new Map(); // lane -> {msgId, timer}: only while the turn that msgId started is running
+  const cancelAck = (id) => { const a = acks.get(id); if (a) { clearTimer(a.timer); acks.delete(id); } };
+  const fireAck = serial(async (id, a) => {
+    if (acks.get(id) !== a) return;
+    acks.delete(id);
+    const to = isGroupLane(id) ? laneDest(id) : null;
+    if (!S.lanes[id]?.inflight || (isGroupLane(id) && !to) || wa.isOpen?.() === false) return;
+    await sendOnce(`ack:${a.msgId}`, ackLine(a.msgId), to, false); // a late ack is worse than none: no retry list
+  });
+  function startAck(id, msgId) {
+    cancelAck(id);
+    if (!msgId || S.outbox[`ack:${msgId}`]) return;
+    const a = { msgId, timer: null };
+    a.timer = setTimer(() => fireAck(id, a).catch((e) => log(`ack failed: ${e.message}`)), ackMs);
+    acks.set(id, a);
+  }
+  // Best effort and never awaited: a reaction must not hold the serial chain while the socket is down.
+  const react = (key, group) => { if (key) Promise.resolve(group ? wa.react?.(key, { jid: group }) : wa.react?.(key)).catch((e) => log(`reaction failed: ${e.message}`)); };
 
   // ---- questions ----
   async function showHead() {
@@ -226,10 +267,12 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   // A group message: its own lane per group, never route(). Allowed when the group is in the family list or the sender is the owner.
   async function onGroupMessage(n) {
     const g = n.group, id = groupLaneId(g.jid);
-    if (!id || !n.text?.trim() || !(groups.has(g.jid) || g.fromOwner === true)) return;
+    const { notes, videos } = mediaNotes(n);
+    const text = [n.text?.trim(), ...notes].filter(Boolean).join("\n"); // a caption-less sticker or image is a message too
+    if (!id || !text || !(groups.has(g.jid) || g.fromOwner === true)) return;
     S.groups[id] = { jid: g.jid, family: groups.has(g.jid) };
     S.lanes[id] ??= newLane();
-    const bare = n.text.replace(ADDRESS, "");
+    const bare = (n.text ?? "").replace(ADDRESS, "");
     const cmd = parseCommand(bare);
     if (cmd) { // only /baru works in a group: /stop, /status and /memori belong to the owner's own chat
       if (cmd !== "baru") return save();
@@ -242,10 +285,11 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       save();
       return sendOnce(`cmd:${id}:${now()}`, "Sesi baru.", laneDest(id));
     }
-    if (S.gq[id]?.length) return answerGroupHead(id, bare, g);
+    if (S.gq[id]?.length) return answerGroupHead(id, bare.trim() ? bare : text, g);
     const pre = preOf(n.quoted);
-    lane(id).queue.push({ text: `[${labelOf(g)}] ${pre ? pre + "\n" : ""}${n.text.trim()}`, id: n.id, quote: g.quote, fromOwner: g.fromOwner === true });
+    lane(id).queue.push({ text: `[${labelOf(g)}] ${pre ? pre + "\n" : ""}${text}`, id: n.id, quote: g.quote, fromOwner: g.fromOwner === true, ack: true, ...(videos.length ? { videos } : {}) });
     save();
+    if (laneDest(id)) react(g.quote?.key, g.jid);
     return pump(id);
   }
 
@@ -259,14 +303,15 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     save();
     if (n.group) return onGroupMessage(n);
     wa.composing();
-    const text = [n.text, ...(n.files ?? []).map((f) => `[file: ${f}]`)].filter(Boolean).join("\n");
+    const { notes, videos } = mediaNotes(n);
+    const text = [n.text, ...notes].filter(Boolean).join("\n");
     if (!text) return;
     const cmd = parseCommand(text);
     if (cmd) return runCommand(cmd);
-    return route(text, n.id, preOf(n.quoted));
+    return route(text, n.id, { pre: preOf(n.quoted), key: n.key, videos });
   }
 
-  async function route(text, msgId, pre) {
+  async function route(text, msgId, { pre, key, videos = [] } = {}) {
     const ap = parseApproval(text);
     const rec = ap && S.codes[ap.code];
     if (rec && known(rec.lane) && now() - rec.ts < CODE_TTL_MS) { // (1) goes to the lane whose message carried the code
@@ -275,7 +320,8 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       return enqueue(rec.lane, text, msgId);
     }
     if (S.queue[0]) return answerHead(parseAnswerFor(S.queue[0], text), text); // (2) the head question
-    return enqueue("chat", text, msgId, pre); // (3) the chat lane
+    react(key);
+    return enqueue("chat", text, msgId, { ...(pre ? { pre } : {}), ...(videos.length ? { videos } : {}), ack: true }); // (3) the chat lane
   }
   const parseAnswerFor = (head, text) => (head.kind === "ask-owner" ? text : parseAnswer(head.questions[head.cursor], text));
 
@@ -285,6 +331,29 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     if (options === null) return sendOnce(`unreadable:${pollId}:${now()}`, POLL_UNREADABLE); // keeps the question at the head
     if (!options.length) return;
     return answerHead(options.join(", "), options.join(", "));
+  }
+
+  // ---- /status: how long a running turn has run and its last guarded action, asked of the runner (it alone knows) ----
+  const statusWait = new Map(); // request id -> resolve
+  let statusSeq = 0;
+  function askRunnerStatus() {
+    const id = `st${++statusSeq}`;
+    return new Promise((res) => {
+      const t = setTimeout(() => { statusWait.delete(id); res(null); }, statusMs);
+      statusWait.set(id, (lanes) => { clearTimeout(t); res(lanes); });
+      toRunner({ op: "status", id });
+    });
+  }
+  // The reply must not wait in the serial chain: the /status command that asked is holding it.
+  function onStatusReply(m) {
+    const done = statusWait.get(String(m.id));
+    if (done) { statusWait.delete(String(m.id)); done(m.lanes && typeof m.lanes === "object" ? m.lanes : null); }
+  }
+  function runInfo(live, id) {
+    const r = live && Object.hasOwn(live, id) ? live[id] : null;
+    if (!r || !Number.isFinite(r.ms) || r.ms < 0) return "";
+    const last = typeof r.last === "string" ? r.last.split("\n")[0].slice(0, 60).trim() : "";
+    return ` ${r.ms < 60000 ? `${Math.floor(r.ms / 1000)} dtk` : `${Math.floor(r.ms / 60000)} mnt`}${last ? `, lagi: ${last}` : ""}`;
   }
 
   // ---- commands ----
@@ -308,7 +377,8 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     if (cmd === "status") {
       const u = S.usage[today()] ?? {};
       const lines = [`runner: ${runnerUp ? "nyambung" : "putus"}, WhatsApp: ${wa.isOpen?.() ? "nyambung" : "putus"}`];
-      for (const [id, L] of Object.entries(S.lanes)) lines.push(`${id}: ${L.inflight ? "jalan" : "diam"}${L.queue.length ? `, antrean ${L.queue.length}` : ""}${hasQuestion(id) ? ", nunggu jawaban" : ""}`);
+      const live = Object.values(S.lanes).some((L) => L.inflight) && runnerUp ? await askRunnerStatus() : null; // {lane: {ms, last}} from the runner, null when it does not answer
+      for (const [id, L] of Object.entries(S.lanes)) lines.push(`${id}: ${L.inflight ? `jalan${runInfo(live, id)}` : "diam"}${L.queue.length ? `, antrean ${L.queue.length}` : ""}${hasQuestion(id) ? ", nunggu jawaban" : ""}`);
       lines.push(`pertanyaan antre: ${S.queue.length}`, `hari ini: ${u.turns ?? 0} turn, in ${u.input ?? 0}, out ${u.output ?? 0}, cache read ${u.cache_read ?? 0}`);
       return sendOnce(`cmd:${now()}`, lines.join("\n"));
     }
@@ -386,6 +456,7 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
       case "session": { const L = lane(m.lane); if (!L.fresh && validSession(m.sessionId)) { S.sessions[m.lane] = m.sessionId; save(); } return; }
       case "text": { // a task lane's text is never sent; a group lane's goes to its own group
         if (typeof m.key !== "string" || m.key.length > 200) return;
+        if (String(m.text ?? "").trim()) cancelAck(m.lane);
         if (m.lane === "chat") return sendOnce(`t:${m.key}`, String(m.text ?? ""));
         const to = laneDest(m.lane);
         if (to) return sendOnce(`t:${m.key}`, String(m.text ?? ""), to);
@@ -417,6 +488,9 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
   async function onResult(m) {
     const L = lane(m.lane);
     const answered = L.inflight?.answered ?? null;
+    cancelAck(m.lane);
+    // The runner has its frames by now and cannot delete from the bridge-owned inbox: the video goes with the turn.
+    for (const v of L.inflight?.videos ?? []) { try { unlinkSync(inside(join(xchg, "inbox"), v.name)); } catch { /* gone */ } }
     L.inflight = null;
     const fresh = L.fresh;
     L.fresh = false;
@@ -444,9 +518,10 @@ export function createCore({ state, xchg, wa, toRunner, groups = new Set(), now 
     return isGroupLane(m.lane) ? showGroupHead(m.lane) : showHead();
   }
 
+  const runnerEvent = serial(onRunnerEvent);
   return {
     state: S,
-    onMessage: serial(onMessage), onVote: serial(onVote), onRunnerEvent: serial(onRunnerEvent), showHead: serial(showHead),
+    onMessage: serial(onMessage), onVote: serial(onVote), onRunnerEvent: (m) => { if (m?.ev === "status") { onStatusReply(m); return Promise.resolve(); } return runnerEvent(m); }, showHead: serial(showHead),
     flushPending: serial(flushPending),
     onOpen: serial(async () => { if (!S.pairedAt) { S.pairedAt = now(); save(); } return flushPending(); }),
     onRunnerDown() { runnerUp = false; },

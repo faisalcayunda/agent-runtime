@@ -55,6 +55,12 @@ RUN mkdir /tmp/rtk && cd /tmp/rtk \
     && install -m 0755 "$(find . -type f -name rtk | head -n1)" /usr/local/bin/rtk \
     && cd / && rm -rf /tmp/rtk
 
+# --- ffmpeg untuk Gremio: runner mengambil frame dari video WhatsApp (Claude tidak bisa membaca video). Layer sendiri, di bawah Hermes/RTK dan di atas
+# cache-bust harian, jadi layer yang mahal tidak ikut rebuild. ---
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && ffmpeg -version | head -n1
+
 # --- Cache-bust harian untuk semua CLI yang mengambil "latest" ---
 # Workflow mengisi CLI_REFRESH dengan tanggal UTC. ARG yang berubah membatalkan cache semua layer
 # sesudahnya, jadi layer sistem/uv/Hermes (yang dikunci) harus ada DI ATAS baris ini.

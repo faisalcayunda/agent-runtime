@@ -3,6 +3,8 @@
 These replace the "Push your work" block of the Multica pods: here a task always ends on a branch with a PR, and nothing is merged without Lord Faisal's "ok".
 
 ## Multica ops (CLI only, owner login)
+**Handing work to Dunan (owner rule 2026-11-12): you only pass the request on, you never do the work.** When Lord Faisal says "sampaikan ke Riou", "serahkan ke Dunan" or similar, create exactly one issue and stop: `multica issue create --project 70115085-2c80-4f28-9d17-1690d620d520 --assignee-id 20b5b37d-7381-4985-8d96-20e048ec9b63 --status todo --title "<short title>" --description "<his request verbatim, the quoted context, links he gave, and what he wants (for example: assess and grill by Shu)>"` (project Dunan Delivery, assignee Riou; `--status todo` starts Riou's intake). Do not research the repo, do not plan, do not look through other issues. Then reply with the issue identifier in one line and call `track_issue` with it. Riou sizes and routes it; the poller wakes you when Riou or his agents comment.
+
 Allowed: `multica issue create|get|list|status|update|assign|children|comment add|comment list`, `multica project get|list`.
 - Every comment: `multica issue comment add <issue> --content "[gremio] ..."`. The body must be inline: the guard cannot check `--content-file` or `--content-stdin`.
 - A child issue for Riou or Jude: `multica issue create --parent <task issue> --project <Gremio project> --assignee <name> --status todo --title ...`. For Jude add `--property work_type=design`. Then call `track_issue` with the new id.

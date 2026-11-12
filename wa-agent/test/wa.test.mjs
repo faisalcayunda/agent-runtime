@@ -7,7 +7,7 @@ import http from "node:http";
 import { existsSync, lstatSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as baileys from "@whiskeysockets/baileys";
-import { ProxyAgent, createWa, decodeVote, groupGate, isOwnerMessage, messageId, normalizeMessage, parseGroups, parseOwners, quotedOf } from "../src/wa.mjs";
+import { ACK_EMOJI, ProxyAgent, createWa, decodeVote, groupGate, isOwnerMessage, messageId, normalizeMessage, parseGroups, parseOwners, quotedOf } from "../src/wa.mjs";
 import { sandbox, waitFor } from "../testlib/helpers.mjs";
 
 const OWNER = "628111@s.whatsapp.net";
@@ -279,15 +279,17 @@ test("upsert: group messages reach the bridge only through the gate, and nothing
   assert.equal(logs.filter((l) => /dropped message from/.test(l)).length, 1);            // only the stranger's DM
 });
 
-test("upsert: the display name falls back to a masked number, and a group voice note is not downloaded", async () => {
+test("upsert: the display name falls back to a masked number, and a group voice note or document is not downloaded", async () => {
   const S = sandbox();
   const { F, got } = await startWa(S, { groups: new Set([FAM]) });
   await F.handlers["messages.upsert"]({ type: "notify", messages: [
     gm({ id: "n1", participant: "628123456789@s.whatsapp.net" }, "gremio hi", null, { pushName: undefined }),
-    { ...gm({ id: "n2" }, ""), message: { imageMessage: { caption: "gremio ini apa", mimetype: "image/jpeg" } } },
+    { ...gm({ id: "n2" }, ""), message: { audioMessage: { mimetype: "audio/ogg" }, extendedTextMessage: { text: "gremio dengar ini" } } },
+    { ...gm({ id: "n3" }, ""), message: { documentMessage: { caption: "gremio baca ini", fileName: "a.pdf" } } },
   ] });
   assert.equal(got.messages[0].group.name, "********6789");
-  assert.equal(got.messages[1].files, undefined); // media from a group is not saved to /xchg/inbox
+  assert.equal(got.messages[1].files, undefined); // only image, sticker and video are saved from a group
+  assert.equal(got.messages[2].files, undefined);
   assert.deepEqual(readdirSync(join(S.xchg, "inbox")), []);
 });
 
@@ -354,4 +356,71 @@ test("a reply reaches the bridge with its quoted message, in a group and in the 
   ] });
   assert.deepEqual(got.messages.map((x) => x.quoted), [{ author: "**8222", text: "[media: image] ini errornya" }, { author: "Gremio", text: "PR-nya siap" }]);
   assert.deepEqual(readdirSync(join(S.xchg, "inbox")), []);
+});
+
+// ---------- images, stickers, video (owner decision 2026-11-12) ----------
+const MB = 1024 * 1024;
+const inbox = (S) => readdirSync(join(S.xchg, "inbox")).sort();
+
+test("owner DM: an image and a sticker are saved to xchg/inbox with their own extension and named in n.media", async () => {
+  const S = sandbox();
+  const { F, got } = await startWa(S);
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [
+    m({ remoteJid: OWNER, id: "i1" }, { imageMessage: { caption: "ini apa", mimetype: "image/jpeg", fileLength: 1000 } }),
+    m({ remoteJid: OWNER, id: "s1" }, { stickerMessage: { mimetype: "image/webp" } }),
+    m({ remoteJid: OWNER, id: "v1" }, { videoMessage: { mimetype: "video/mp4", seconds: 12, fileLength: 2 * MB } }),
+  ] });
+  assert.deepEqual(inbox(S), ["i1.jpg", "s1.webp", "v1.mp4"]);
+  const [i, s, v] = got.messages;
+  assert.deepEqual([i.text, i.files, i.media.path, i.media.kind], ["ini apa", [join(S.xchg, "inbox", "i1.jpg")], join(S.xchg, "inbox", "i1.jpg"), "image"]);
+  assert.deepEqual([s.media.kind, s.media.path, s.text], ["sticker", join(S.xchg, "inbox", "s1.webp"), ""]);
+  assert.deepEqual([v.media.kind, v.media.seconds, v.media.path], ["video", 12, join(S.xchg, "inbox", "v1.mp4")]);
+  assert.equal(got.messages[0].key.id, "i1"); // the bridge reacts to this key
+});
+
+test("a family-group image addressed to Gremio is saved; an unaddressed or ungated one is not", async () => {
+  const S = sandbox();
+  const { F, got } = await startWa(S, { groups: new Set([FAM]) });
+  const img = (key, caption) => ({ ...gm(key, ""), message: { imageMessage: { caption, mimetype: "image/jpeg" } } });
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [
+    img({ id: "g1" }, "gremio ini apa?"),
+    img({ id: "g2" }, "foto liburan"),                                   // chatter
+    img({ id: "g3", remoteJid: OTHER }, "gremio ini apa?"),              // another group, a member
+    { ...gm({ id: "g4" }, ""), message: { stickerMessage: { mimetype: "image/webp" }, messageContextInfo: {} } }, // not addressed
+  ] });
+  assert.deepEqual(got.messages.map((x) => x.id), ["g1"]);
+  assert.deepEqual(got.messages[0].files, [join(S.xchg, "inbox", "g1.jpg")]);
+  assert.equal(got.messages[0].group.jid, FAM);
+  assert.deepEqual(inbox(S), ["g1.jpg"]);
+});
+
+test("media over the cap is skipped and flagged: by the claimed size without downloading, and by the real bytes", async () => {
+  const S = sandbox();
+  let downloads = 0, size = 0;
+  const { F, got } = await startWa(S);
+  F.lib.downloadMediaMessage = async () => { downloads++; return Buffer.alloc(size); };
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [
+    m({ remoteJid: OWNER, id: "b1" }, { imageMessage: { mimetype: "image/jpeg", fileLength: 11 * MB } }),
+    m({ remoteJid: OWNER, id: "b2" }, { videoMessage: { mimetype: "video/mp4", fileLength: 51 * MB } }),
+  ] });
+  assert.equal(downloads, 0);
+  size = 11 * MB; // the sender claimed less than the bytes
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [m({ remoteJid: OWNER, id: "b3" }, { stickerMessage: { fileLength: 1 } })] });
+  size = 20 * MB; // a video of 20 MB is within its own cap
+  await F.handlers["messages.upsert"]({ type: "notify", messages: [m({ remoteJid: OWNER, id: "b4" }, { videoMessage: { fileLength: 20 * MB, seconds: 3 } })] });
+  assert.deepEqual(got.messages.map((x) => [x.media.tooLarge ?? false, x.media.path ? "saved" : "none"]), [[true, "none"], [true, "none"], [true, "none"], [false, "saved"]]);
+  assert.deepEqual(inbox(S), ["b4.mp4"]);
+});
+
+test("react: the owner's DM goes to the owner, a group message to its own group; nothing else", async () => {
+  const S = sandbox();
+  const { F, wa } = await startWa(S);
+  await wa.react({ id: "M1", remoteJid: "555@lid", fromMe: false });
+  await wa.react({ id: "M2", remoteJid: FAM, participant: MEMBER }, { jid: FAM });
+  await wa.react(undefined);
+  await assert.rejects(wa.react({ id: "M3", remoteJid: "628222@s.whatsapp.net" }, { jid: "628222@s.whatsapp.net" }), /not a group JID/);
+  await assert.rejects(wa.react({ id: "M4", remoteJid: OTHER }, { jid: FAM }), /not a group JID/); // the key must be from that chat
+  const sends = F.sent.filter((x) => x.content?.react);
+  assert.deepEqual(sends.map((x) => [x.jid, x.content.react.text, x.content.react.key.id]), [[OWNER, ACK_EMOJI, "M1"], [FAM, ACK_EMOJI, "M2"]]);
+  assert.equal(ACK_EMOJI, "\u{1F440}");
 });

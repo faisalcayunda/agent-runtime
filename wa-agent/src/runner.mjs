@@ -7,7 +7,8 @@
 import net from "node:net";
 import { spawn as nodeSpawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, existsSync, fstatSync } from "node:fs";
+import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, existsSync, fstatSync } from "node:fs";
+import { setPriority } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { LineSplitter, parseLine, pickResult } from "./stream.mjs";
@@ -21,6 +22,7 @@ const CODE_RE = /^[a-z0-9]{3,8}-[0-9]{3,6}$/i;
 // default. WA_MAX_TASK_LANES may raise it to 2; any other value means 1.
 export const maxTaskLanes = (v) => (v === "2" ? 2 : 1);
 const MAX_BUFFER = 500; // events kept for a bridge that is away
+const VIDEO_FRAMES = 4;
 
 // Variables a turn may see (PLAN 2.2). Anything else in the container never reaches `claude`.
 // MULTICA_SERVER_URL and MULTICA_WORKSPACE_ID are an addition (non-secret; the CLI needs a workspace): see report.
@@ -120,6 +122,23 @@ export function createRunner(opts) {
     return d;
   }
 
+  // The newest guard.log line of a session: what a running turn last did through a guarded tool (first line of `subject`, 60 chars).
+  function lastAction(sessionId) {
+    if (!sessionId) return "";
+    let fd;
+    try { fd = openSync(guardLog, "r"); } catch { return ""; }
+    try {
+      const size = fstatSync(fd).size, len = Math.min(size, 65536), buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, size - len);
+      const lines = buf.toString("utf8").split("\n");
+      for (let i = lines.length - 1; i >= 0; i--) {
+        let r; try { r = JSON.parse(lines[i]); } catch { continue; }
+        if (r?.session_id === sessionId) return String(r.subject ?? r.tool ?? "").split("\n")[0].slice(0, 60);
+      }
+      return "";
+    } catch { return ""; } finally { closeSync(fd); }
+  }
+
   // ---- grant-used (PLAN 2.12): the guard logged pass-grant lines; every grant id on them is reported until acked ----
   function drainGuardLog(lane) {
     let fd;
@@ -157,13 +176,14 @@ export function createRunner(opts) {
     const argvFor = (prompt) => buildArgv({ prompt, session: req.session || null, model, mcpConfig: join(agentDir, "config", "mcp.json"), voice: join(agentDir, "config", isGroupLane(lane) ? "voice-group.md" : "voice.md"), permissionMode });
     try { argvFor(req.prompt ?? ""); } catch (e) { return toBridge({ ev: "result", lane, error: e.message }); } // an empty or fable model fails here
     // fromOwner: the bridge says whether the one message that started this group turn came from the owner (start_task needs it).
-    const entry = { stderr: "", killed: false, proc: null, origin: req.origin ?? null, final: null, fromOwner: isGroupLane(lane) && req.fromOwner === true };
+    const entry = { stderr: "", killed: false, proc: null, origin: req.origin ?? null, final: null, fromOwner: isGroupLane(lane) && req.fromOwner === true, frameDirs: [], startedAt: Date.now(), sessionId: req.session || null };
     lanes.set(lane, entry); // the lane is busy from here on, also while the wiki work below runs
     // A turn with a real prompt (every chat prompt, every task-lane turn that has one) first refreshes the clone and then gets
     // the wiki-retrieve context prepended here. The UserPromptSubmit hook cannot do this: it does not fire on an empty-prompt
     // resume and fires with a synthetic prompt after an answer (spike T13). Resumes retrieve nothing. Fail soft throughout.
-    const prompt = req.prompt ?? "";
     const go = async () => {
+      // Claude cannot read a video: the bridge names each one in req.videos (only it can), and its marker becomes frame paths.
+      const prompt = await withVideoFrames(req.prompt ?? "", req.videos, entry);
       let ctx = "";
       if (prompt !== "") { await wikiRefresh().catch(() => {}); ctx = await wikiContext(prompt).catch(() => ""); }
       startClaude(lane, req, argvFor(ctx ? `${ctx}\n\n${prompt}` : prompt), entry);
@@ -171,8 +191,44 @@ export function createRunner(opts) {
     go();
   }
 
+  // ---- video frames (owner decision 2026-11-12): up to VIDEO_FRAMES evenly spaced JPEGs in ~/assistant/media/<id>/ ----
+  // The inbox belongs to the bridge, so frames go to a worker-owned dir and are removed when the turn ends; the bridge deletes the
+  // video itself. ffmpeg runs once, at the lowest priority, killed after ffmpegTimeoutMs; missing or failing ffmpeg is not an error.
+  // The bytes come from a group member: the mov/mp4 demuxer is forced and only the file protocol is allowed (no playlist, no network).
+  const mediaDir = join(home, "assistant", "media");
+  const VIDEO_NAME = /^[\w-]{1,100}\.[A-Za-z0-9]{1,8}$/;
+  const dropFrames = (entry) => { for (const d of entry.frameDirs.splice(0)) rmSync(d, { recursive: true, force: true }); };
+  function extractFrames(file, seconds, dir) {
+    return new Promise((res) => {
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      const rate = seconds > 0 ? `${VIDEO_FRAMES}/${seconds}` : "1"; // length unknown: the first seconds
+      let p;
+      try { p = spawn("ffmpeg", ["-nostdin", "-v", "error", "-protocol_whitelist", "file", "-f", "mov", "-i", file, "-vf", `fps=${rate}`, "-frames:v", String(VIDEO_FRAMES), "-q:v", "4", join(dir, "frame-%d.jpg")], { env: { PATH: srcEnv.PATH }, stdio: "ignore", timeout: opts.ffmpegTimeoutMs ?? 60000, killSignal: "SIGKILL" }); } catch { return res([]); }
+      try { setPriority(p.pid, 19); } catch { /* not started, or not allowed */ }
+      const done = () => { try { res(readdirSync(dir).filter((f) => /^frame-\d+\.jpg$/.test(f)).sort((a, b) => parseInt(a.slice(6), 10) - parseInt(b.slice(6), 10)).slice(0, VIDEO_FRAMES).map((f) => join(dir, f))); } catch { res([]); } };
+      p.on("error", () => res([]));
+      p.on("close", (code) => (code === 0 ? done() : res([])));
+    });
+  }
+  async function withVideoFrames(prompt, videos, entry) {
+    for (const v of Array.isArray(videos) ? videos : []) {
+      const name = String(v?.name ?? "");
+      if (!VIDEO_NAME.test(name)) continue;
+      const marker = `[video: ${name}]`;
+      if (!prompt.includes(marker)) continue;
+      const seconds = Math.min(Math.max(Math.round(Number(v.seconds)) || 0, 0), 36000);
+      const dir = join(mediaDir, name.replace(/\.[^.]*$/, ""));
+      entry.frameDirs.push(dir);
+      let frames = [];
+      try { frames = await extractFrames(inside(join(xchg, "inbox"), name), seconds, dir); } catch (e) { log(`video frames: ${e.message}`); }
+      prompt = prompt.replace(marker, frames.length ? `[video${seconds ? ` ${seconds}s` : ""}, frame: ${frames.join(", ")}]` : "[video: tidak bisa dibaca]");
+    }
+    return prompt;
+  }
+
   function startClaude(lane, req, argv, entry) {
-    if (entry.killed) { lanes.delete(lane); toBridge({ ev: "result", lane, error: "stopped" }); return checkShutdown(); } // /stop during the refresh
+    if (entry.killed) { dropFrames(entry); lanes.delete(lane); toBridge({ ev: "result", lane, error: "stopped" }); return checkShutdown(); } // /stop during the refresh
     let changed = [];
     try { changed = doReset(); } catch (e) { log(`reset failed: ${e.message}`); }
     if (changed.length) toBridge({ ev: "notice", text: `Policy file balik ke aslinya sebelum turn: ${changed.join(", ")}` });
@@ -183,7 +239,7 @@ export function createRunner(opts) {
     const split = new LineSplitter();
     const handle = (line) => {
       for (const ev of parseLine(line)) {
-        if (ev.type === "init" && ev.sessionId) toBridge({ ev: "session", lane, sessionId: ev.sessionId });
+        if (ev.type === "init" && ev.sessionId) { entry.sessionId = ev.sessionId; toBridge({ ev: "session", lane, sessionId: ev.sessionId }); }
         else if (ev.type === "text" && (lane === "chat" || isGroupLane(lane))) toBridge({ ev: "text", lane, text: ev.text, key: ev.key }); // task lanes never forward text; a group lane's goes to its group
         else if (ev.type === "tool_result") drainGuardLog(lane);
         else if (ev.type === "result") {
@@ -201,6 +257,7 @@ export function createRunner(opts) {
     proc.on("close", (code, signal) => {
       split.flush().forEach(handle);
       drainGuardLog(lane);
+      dropFrames(entry);
       lanes.delete(lane);
       tokens.delete(lane);
       const f = entry.final;
@@ -420,6 +477,11 @@ export function createRunner(opts) {
       case "turn": return runTurn(m);
       case "stop": for (const [, e] of lanes) { e.killed = true; e.proc?.kill("SIGTERM"); } return;
       case "ping": return send(sock, { ev: "pong" });
+      case "status": { // for the owner's /status: running turns, how long, and the last guarded action of each
+        const out = {};
+        for (const [lane, e] of lanes) out[lane] = { ms: Date.now() - e.startedAt, last: lastAction(e.sessionId) };
+        return send(sock, { ev: "status", id: String(m.id ?? "").slice(0, 64), lanes: out });
+      }
       case "ack": if (validFile(m.file)) { try { unlinkSync(inside(join(xchg, "events"), m.file)); } catch { /* gone */ } } return;
       case "grant-ack": {
         const g = reg.guard;

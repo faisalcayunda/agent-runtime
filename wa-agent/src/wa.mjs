@@ -1,6 +1,7 @@
 // WhatsApp side of the bridge: Baileys socket, owner gate, group gate, normalized events, polls with persisted creation
-// messages (PLAN 2.2, 2.2.1, 2.13, 5.2 item 1). It sends to the owner (no send function takes a JID) and, through sendGroup,
-// to a group JID the bridge picked.
+// messages (PLAN 2.2, 2.2.1, 2.13, 5.2 item 1). It sends to the owner (no send function takes a JID) and, through sendGroup
+// and react, to a group JID the bridge picked; both refuse anything that is not a group JID, and react also requires the key
+// to be from that same chat.
 //
 // Parts adapted from Hermes Agent's WhatsApp bridge (scripts/whatsapp-bridge/bridge.js and bridge_helpers.js,
 // github.com/NousResearch/hermes-agent @ 5df966a), MIT License, Copyright (c) 2025 Nous Research:
@@ -31,6 +32,11 @@ export function isOwnerMessage(msg, owners) {
 // ---------- group gate (PLAN 2.13) ----------
 const GROUP_JID = /^\d{5,30}(?:-\d{1,20})?@g\.us$/;
 export const parseGroups = (s) => new Set(String(s ?? "").split(",").map((x) => x.trim()).filter((x) => GROUP_JID.test(x)));
+
+// Media the model can look at (owner DM and every allowed group message, owner decision 2026-11-12) and the size above which it is skipped.
+const MB = 1024 * 1024;
+export const MEDIA_CAPS = { image: 10 * MB, sticker: 10 * MB, video: 20 * MB };
+export const ACK_EMOJI = "👀";
 
 const contextOf = (m) => { for (const v of Object.values(m ?? {})) if (v && typeof v === "object" && v.contextInfo) return v.contextInfo; return null; };
 const GREMIO_ID = /^GR[0-9A-F]{30}$/; // the shape messageId() gives every message this bridge sends
@@ -91,9 +97,9 @@ const num = (v) => Number(v?.toString?.() ?? v ?? 0);
 
 export function normalizeMessage(msg) {
   const m = unwrap(msg.message);
-  const media = ["imageMessage", "documentMessage", "audioMessage", "videoMessage"].find((k) => m[k]);
+  const media = ["imageMessage", "documentMessage", "audioMessage", "videoMessage", "stickerMessage"].find((k) => m[k]);
   const text = m.conversation ?? m.extendedTextMessage?.text ?? (media ? m[media].caption : "") ?? "";
-  return { id: msg.key.id, ts: num(msg.messageTimestamp), text: text ?? "", media: media ? { kind: media.replace("Message", ""), mimetype: m[media].mimetype ?? "", fileName: m[media].fileName ?? "" } : null, pollUpdate: m.pollUpdateMessage ?? null };
+  return { id: msg.key.id, ts: num(msg.messageTimestamp), text: text ?? "", media: media ? { kind: media.replace("Message", ""), mimetype: m[media].mimetype ?? "", fileName: m[media].fileName ?? "", size: num(m[media].fileLength), seconds: num(m[media].seconds) } : null, pollUpdate: m.pollUpdateMessage ?? null };
 }
 
 // ---------- poll votes (Hermes bridge_helpers.js pollUpdateForAggregation, condensed) ----------
@@ -186,7 +192,7 @@ export function createWa({ lib, owners, groups = new Set(), ownerJid, authDir, x
     }
     const selfIds = () => new Set([sock?.user?.id, sock?.user?.lid].filter(Boolean).map(bare));
     // A group message is dealt with only when it addresses Gremio, and then silently dropped unless the gate passes: group
-    // chatter and members' names are never logged. No media is saved from a group.
+    // chatter and members' names are never logged. Only image, sticker and video are saved from a group, and only after the gate.
     async function groupEvent(msg) {
       const k = msg.key;
       if (k.fromMe || !isAddressed(msg, selfIds())) return null;
@@ -198,6 +204,7 @@ export function createWa({ lib, owners, groups = new Set(), ownerJid, authDir, x
       if (!g) return null;
       const n = normalizeMessage(msg);
       if (n.pollUpdate) return null;
+      if (n.media && n.media.kind in MEDIA_CAPS) await keepMedia(msg, n);
       const quoted = quotedOf(msg, { self: selfIds(), owners });
       return { ...n, ...(quoted ? { quoted } : {}), group: { ...g, name: msg.pushName || maskJid(k.participantAlt ?? k.participant ?? ""), quote: { key: { id: k.id, remoteJid: k.remoteJid, participant: k.participant }, message: { conversation: n.text.slice(0, 200) } } } };
     }
@@ -220,7 +227,8 @@ export function createWa({ lib, owners, groups = new Set(), ownerJid, authDir, x
         const quoted = quotedOf(msg, { self: selfIds(), owners });
         if (quoted) n.quoted = quoted;
         if (n.pollUpdate) { handleVote(msg, n.pollUpdate); continue; }
-        if (n.media) { try { n.files = [await saveMedia(msg, n)]; } catch (e) { log(`media failed: ${e.message}`); } }
+        n.key = msg.key; // the bridge reacts to this message (react)
+        if (n.media) await keepMedia(msg, n);
         try { await onMessage(n); } catch (e) { log(`onMessage failed: ${e.stack}`); }
       }
     });
@@ -250,13 +258,21 @@ export function createWa({ lib, owners, groups = new Set(), ownerJid, authDir, x
   }
 
   // Media goes to /xchg/inbox (the worker reads it there); the bridge only saves bytes, never parses them (PLAN 5.3).
-  async function saveMedia(msg, n) {
-    const buf = await lib.downloadMediaMessage(msg, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
-    const ext = (n.media.fileName.match(/\.[A-Za-z0-9]{1,8}$/)?.[0] ?? ({ image: ".jpg", video: ".mp4", audio: ".ogg", document: "" })[n.media.kind] ?? "");
-    const path = join(xchg, "inbox", `${n.id.replace(/[^\w-]/g, "_")}${ext}`);
-    mkdirSync(join(xchg, "inbox"), { recursive: true });
-    safeWrite(path, buf, 0o644);
-    return path;
+  // Sets n.files and n.media.path on success, n.media.tooLarge when it is over the kind's cap (the size in the message is only
+  // a claim, so the downloaded bytes are checked again), and leaves both unset when the download fails.
+  async function keepMedia(msg, n) {
+    const cap = MEDIA_CAPS[n.media.kind];
+    try {
+      if (cap && n.media.size > cap) { n.media.tooLarge = true; return; }
+      const buf = await lib.downloadMediaMessage(msg, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
+      if (cap && buf.length > cap) { n.media.tooLarge = true; return; }
+      const ext = (n.media.fileName.match(/\.[A-Za-z0-9]{1,8}$/)?.[0] ?? ({ image: ".jpg", sticker: ".webp", video: ".mp4", audio: ".ogg", document: "" })[n.media.kind] ?? "");
+      const path = join(xchg, "inbox", `${n.id.replace(/[^\w-]/g, "_")}${ext}`);
+      mkdirSync(join(xchg, "inbox"), { recursive: true });
+      safeWrite(path, buf, 0o644);
+      n.files = [path];
+      n.media.path = path;
+    } catch (e) { log(`media failed: ${e.message}`); }
   }
 
   const ready = () => (open ? Promise.resolve() : new Promise((r) => waiters.push(r)));
@@ -282,6 +298,13 @@ export function createWa({ lib, owners, groups = new Set(), ownerJid, authDir, x
     sendText: (text, { id } = {}) => withRetry(() => sock.sendMessage(to, { text }, id ? { messageId: id } : {})),
     // The one send that takes a JID, and only a group JID: the bridge maps a group lane to its group and passes nothing else.
     sendGroup: (jid, text, { id, quote } = {}) => (GROUP_JID.test(String(jid)) ? withRetry(() => sock.sendMessage(jid, { text }, { ...(id ? { messageId: id } : {}), ...(quote ? { quoted: quote } : {}) })) : Promise.reject(new Error("not a group JID"))),
+    // Reaction to a message the bridge is about to work on: the owner's DM (no jid) or a group message (the group JID, which must
+    // be the message's own chat). Same destinations as every other send; best effort, the caller does not wait on it.
+    react: (key, { jid } = {}) => {
+      if (!key?.id) return Promise.resolve();
+      if (jid === undefined) return withRetry(() => sock.sendMessage(to, { react: { text: ACK_EMOJI, key } }));
+      return GROUP_JID.test(String(jid)) && key.remoteJid === jid ? withRetry(() => sock.sendMessage(jid, { react: { text: ACK_EMOJI, key } })) : Promise.reject(new Error("not a group JID"));
+    },
     // Returns {id, raw}: the poll creation message, JSON-encoded for state.json (messageSecret included).
     sendPoll: (name, values, { id, multi = false } = {}) => withRetry(async () => {
       const sent = await sock.sendMessage(to, { poll: { name, values, selectableCount: multi ? values.length : 1 } }, id ? { messageId: id } : {});
