@@ -28,6 +28,9 @@ const DB_CLIENT = /\b(psql|mysql|mariadb|sqlite3|trino|clickhouse-client|duckdb|
 const NO_SQL_SCAN = /^mcp__(owner|context7)__/;
 const STRUCT_NOUNS = new Set(["agent", "workspace", "skill", "project", "workflow", "autopilot", "runtime", "squad"]);
 const READ_VERBS = new Set(["list", "ls", "get", "show", "view", "search", "status", "info"]);
+// Structure writes Gremio may run (owner decision 2026-11-12: it logs in with its own member account, so Multica's
+// permissions bound it). Everything else on these nouns that is not a read verb is denied, delete/archive included.
+const MULTICA_STRUCT_WRITES = { project: new Set(["create", "update"]), agent: new Set(["create", "update"]), workflow: new Set(["create"]), workspace: new Set(["switch"]) };
 const MULTICA_GLOBAL_VALUE_FLAGS = new Set(["--profile", "--server-url", "--workspace-id"]);
 
 const deny = (rule, reason) => ({ deny: true, rule, reason });
@@ -322,15 +325,25 @@ function rmRules(rest, ctx) {
   return null;
 }
 
-// multica CLI (PLAN 5.2, S11). The worker holds the owner token, so this is a speed bump.
+// multica CLI (PLAN 5.2, S11). Gremio's own member account bounds it server-side; this is a speed bump.
 function multicaRules(rest) {
   let i = 0;
   while (i < rest.length && rest[i].startsWith("-")) i += MULTICA_GLOBAL_VALUE_FLAGS.has(rest[i]) ? 2 : 1;
   const [noun, verb, verb2] = [rest[i], rest[i + 1], rest[i + 2]].map((t) => (t && !t.startsWith("-") ? t : undefined));
   if (STRUCT_NOUNS.has(noun)) {
-    // Only read verbs pass; anything else, including a verb this list does not know, is denied.
-    if (verb && !READ_VERBS.has(verb)) return deny("multica-structure-write", `multica ${noun} ${verb} changes Multica structure and is never run by the agent`);
-    return null;
+    // Allowlist: read verbs and MULTICA_STRUCT_WRITES pass; anything else, including a verb this list does not know, is denied.
+    if (!verb) {
+      // A flag between noun and verb hides the verb from this parser: only bare help passes.
+      const next = rest[i + 1];
+      if (next === undefined || next === "--help" || next === "-h") return null;
+      return deny("multica-structure-write", `put the verb right after "multica ${noun}"; flags before the verb are not allowed`);
+    }
+    if (READ_VERBS.has(verb)) return null;
+    if (noun === "agent" && verb === "skills") {
+      return READ_VERBS.has(verb2) ? null : deny("multica-structure-write", "multica agent skills set|add changes another agent's prompt and is never run by the agent");
+    }
+    if (MULTICA_STRUCT_WRITES[noun]?.has(verb)) return null;
+    return deny("multica-structure-write", `multica ${noun} ${verb} is not on the allowed list (project create|update, agent create|update|skills list, workflow create, workspace switch, reads); never run by the agent`);
   }
   if (noun !== "issue") return null;
   if (verb === "delete") return deny("multica-issue-delete", "multica issue delete is never run by the agent");

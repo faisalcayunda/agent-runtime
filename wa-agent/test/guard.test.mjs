@@ -121,9 +121,8 @@ test("a grant of another kind does not satisfy a merge", () => {
 // ---- multica (S11) ----
 test("the guard denies Multica structure writes and comments without [gremio]", () => {
   for (const c of [
-    "multica agent create --name x", "multica agent update abc --instructions y", "multica skill create --name x",
-    "multica project update p1 --name x", "multica workflow create --steps-file f.json", "multica autopilot create x",
-    "multica runtime delete r1", "multica squad create x", "multica workspace create x",
+    "multica skill create --name x", "multica skill update s1 --content y", "multica autopilot create x",
+    "multica runtime delete r1", "multica squad create x", "multica squad update s1", "multica workspace create x",
     "multica --profile dev agent delete a1", "multica --workspace-id w1 project delete p1", "multica issue delete 1",
     "multica issue comment delete c1",
   ]) denies(bash(c));
@@ -142,6 +141,28 @@ test("the guard allows Multica reads, issue work and [gremio] comments", () => {
     "multica issue get 1 --output json", "multica issue comment list 1 --output json --since 2026-01-01T00:00:00Z",
     `multica issue comment add 1 --content "[gremio] done with the review"`,
     `multica issue comment add 1 --content="[gremio] kerja udah masuk PR"`,
+  ]) passes(bash(c));
+});
+
+test("the guard denies Multica deletes, workspace writes, skill binding and anything off the allowed list", () => {
+  for (const c of [
+    "multica agent delete a1", "multica agent archive a1", "multica agent restore a1", "multica agent copy a1", "multica agent env set a1 K=V",
+    "multica agent skills set a1 --skill-ids s1", "multica agent skills add a1 --skill-ids s1", "multica agent skills",
+    "multica project delete p1", "multica project resource add p1", "multica workspace update w1 --name x", "multica workspace member add w1 x",
+    "multica workspace invite x", "multica workspace delete w1", "multica workspace create x", "multica workspace mcp add x",
+    "multica workflow update f1", "multica workflow delete f1", "multica workflow archive f1", "multica workflow remove f1",
+    "multica skill delete s1", "multica skill create --name x", "multica autopilot create x", "multica runtime update r1", "multica squad create x",
+    "multica agent --output json delete a1", "multica project --yes delete p1", "multica --profile dev agent skills set a1 --skill-ids s1",
+    "multica --workspace-id w1 agent delete a1", `bash -c 'multica project delete p1'`,
+  ]) denies(bash(c), "multica-structure-write");
+});
+test("the guard allows the Multica project, agent, workflow and workspace-switch writes Gremio owns (own member account, 2026-11-12)", () => {
+  for (const c of [
+    "multica project create --title Co-operative", "multica project update p1 --title x", "multica project update p1 --status in_progress",
+    "multica agent create --name x --instructions y", "multica agent update a1 --instructions y", "multica agent skills list a1",
+    "multica workflow create --steps-file f.json", "multica workflow get f1", "multica workflow list",
+    "multica workspace switch w1", "multica workspace list", "multica workspace get w1", "multica --profile x workspace switch w1",
+    "multica --workspace-id w1 project create --title t", "multica agent --help", "multica project -h", "multica project",
   ]) passes(bash(c));
 });
 
