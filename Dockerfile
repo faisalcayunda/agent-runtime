@@ -66,6 +66,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 ARG PLAYWRIGHT_DEPS_VERSION=1.64.1
 RUN npx -y "playwright@${PLAYWRIGHT_DEPS_VERSION}" install-deps chromium \
     && rm -rf /var/lib/apt/lists/* /root/.npm
+# --- Paket Python untuk render video/grafis agen (Luc: Pillow, numpy, edge-tts; ffmpeg sudah dari layer sebelumnya). Versi dikunci. ---
+RUN pip3 install --no-cache-dir --break-system-packages "pillow==13.0.0" "numpy==2.5.4" "edge-tts==7.3.1" \
+    && python3 -c "import PIL, numpy; print('pillow', PIL.__version__, 'numpy', numpy.__version__)" && edge-tts --help >/dev/null
 
 # --- Cache-bust harian untuk semua CLI yang mengambil "latest" ---
 # Workflow mengisi CLI_REFRESH dengan tanggal UTC. ARG yang berubah membatalkan cache semua layer
