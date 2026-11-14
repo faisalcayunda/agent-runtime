@@ -9,7 +9,9 @@ ROUTER_URL="${ROUTER_URL:-http://ninerouter.ai.svc.cluster.local}"
 # combo per role di 9router; Claude Code hanya boleh combo yang isinya Claude semua (role-exec, role-architect)
 DEFAULT_MODEL="${DEFAULT_MODEL:-role-exec}"
 SMALL_MODEL="${SMALL_MODEL:-role-exec}"
-ROUTER_MODELS="${ROUTER_MODELS:-role-leader role-architect role-exec role-review role-research role-writer role-designer gemini-3.8-flash}"
+ROUTER_MODELS="${ROUTER_MODELS:-role-leader role-architect role-exec role-review role-research role-writer role-designer role-decider gemini-3.8-flash}"
+# alias yang boleh menerima gambar (combo 9router-nya punya backend vision); hanya dipakai katalog dsh
+VISION_MODELS="${VISION_MODELS:-role-decider role-leader gemini-3.8-flash}"
 CODEX_WIRE_API="${CODEX_WIRE_API:-responses}"
 ASSETS=/opt/agent-assets
 DSH_BRIDGE=/opt/dsh-multica-runtime
@@ -170,6 +172,15 @@ for args in "-g --auto-patch" "-g --opencode" "-g --codex" "--agent hermes" "-g 
     || echo "[agent-runtime] rtk init $args: GAGAL (diabaikan)"
 done
 
+# --- antislop: tanpa settings.json skill bertanya "When do you want to use antislop?" dan run headless menggantung; mode "during" = aturan langsung dipakai ---
+ANTISLOP_SETTINGS="$HOME/.config/antislop/settings.json"
+{ mkdir -p "$(dirname "$ANTISLOP_SETTINGS")" \
+  && printf '{"mode":"during"}\n' > "$ANTISLOP_SETTINGS.tmp" \
+  && { cmp -s "$ANTISLOP_SETTINGS.tmp" "$ANTISLOP_SETTINGS" && rm -f "$ANTISLOP_SETTINGS.tmp" \
+       || { chmod 644 "$ANTISLOP_SETTINGS.tmp" && mv "$ANTISLOP_SETTINGS.tmp" "$ANTISLOP_SETTINGS"; }; } \
+  && echo "[agent-runtime] antislop mode: ok"; } \
+  || echo "[agent-runtime] antislop mode: GAGAL (diabaikan)"
+
 # ===================== DeepSeek Harness: bridge Multica =====================
 
 DSH_MARK="$HOME/.agent-runtime/dsh-bridge-$(cat "$DSH_BRIDGE/COMMIT")"
@@ -190,10 +201,14 @@ DSH_PATCH="$HOME/.dsh/profiles/multica/cordis.patch.yml"
 { echo "# dikelola entrypoint.sh, ditimpa tiap boot; patch sendiri lewat --patch"
   jq -n \
   --arg models "$ROUTER_MODELS" \
+  --arg vision "$VISION_MODELS" \
   --arg defmodel "$DEFAULT_MODEL" '
-  [
+  ($vision | split(" ") | map(select(length > 0))) as $v
+  | [
     { id: "llm-deepseek",
-      config: { models: ($models | split(" ") | map(select(length > 0)) | map({id: ., name: .})) } },
+      config: { models: ($models | split(" ") | map(select(length > 0))
+        | map({id: ., name: .}
+              | if (.id | IN($v[])) then . + {inputModalities: ["text", "image"], imageMaxBytes: 4194304} else . end)) } },
     { id: "agent-default-model",
       config: { provider: "deepseek-official", model: $defmodel } },
     { id: "session-log-deepseek", disabled: true },
